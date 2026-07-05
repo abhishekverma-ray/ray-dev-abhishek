@@ -29,6 +29,7 @@ from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
     PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
 )
 from ray.data._internal.util import MiB
+from ray.data.context import DataContext
 from ray.data.expressions import Expr
 from ray.util.annotations import DeveloperAPI
 from ray.util.debug import log_once
@@ -297,10 +298,14 @@ class ParquetFileReader(FileReader):
         # Coalesce a partition's sister chunks per file into contiguous
         # row-group runs, so each file is read in a single scan (one open +
         # cached footer + sequential I/O) rather than one scan per row group.
+        validate_against_footer = (
+            DataContext.get_current().parquet_validate_chunk_ranges_at_read_time
+        )
         return fragments_to_read_for_manifest(
             path_to_fragment,
             manifest.paths,
             manifest.file_chunk_metadatas,
+            validate_against_footer=validate_against_footer,
         )
 
     @override

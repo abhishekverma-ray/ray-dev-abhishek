@@ -45,6 +45,7 @@ class TestCreateChunkMetadata:
                 row_group_end=1,
                 in_memory_size=0,
                 num_rows=1,
+                row_offset=0,
                 extra_field="boom",
             )
 
@@ -55,12 +56,14 @@ class TestCreateChunkMetadata:
             row_group_end=5,
             in_memory_size=7,
             num_rows=9,
+            row_offset=0,
         )
         assert md == {
             "row_group_start": 2,
             "row_group_end": 5,
             "in_memory_size": 7,
             "num_rows": 9,
+            "row_offset": 0,
         }
 
 
@@ -170,6 +173,42 @@ class TestParquetFileChunker:
         m, _ = chunks[0]
         assert (m["row_group_start"], m["row_group_end"]) == (0, 4)
         assert m["num_rows"] == 40
+
+    def test_row_offset_zero_for_first_chunk(self, tmp_path):
+        p = str(tmp_path / "d.parquet")
+        size = _write_parquet_with_row_groups(p, num_row_groups=5, rows_per_group=10)
+        chunker = ParquetFileChunker(target_chunk_size=1)
+        chunks = list(chunker.generate_chunk_metadatas(p, size))
+        assert chunks[0][0]["row_offset"] == 0
+
+    def test_row_offset_accumulates_across_chunks(self, tmp_path):
+        # One chunk per row group (target below rg size): row_offset for
+        # chunk i must equal the total rows in all preceding row groups.
+        p = str(tmp_path / "d.parquet")
+        size = _write_parquet_with_row_groups(p, num_row_groups=5, rows_per_group=10)
+        chunker = ParquetFileChunker(target_chunk_size=1)
+        chunks = list(chunker.generate_chunk_metadatas(p, size))
+        assert [m["row_offset"] for m, _ in chunks] == [0, 10, 20, 30, 40]
+
+    def test_row_offset_with_bundled_multi_row_group_chunks(self, tmp_path):
+        # Some row groups bundle into multi-row-group chunks; row_offset must
+        # still track cumulative rows across the WHOLE file, not per-bundle.
+        p = str(tmp_path / "d.parquet")
+        size = _write_parquet_with_row_groups(p, num_row_groups=12, rows_per_group=5)
+        chunker = ParquetFileChunker(target_chunk_size=400)
+        chunks = list(chunker.generate_chunk_metadatas(p, size))
+        assert len(chunks) > 1  # confirm bundling actually happened
+        assert chunks[0][0]["row_offset"] == 0
+        for (m_prev, _), (m_next, _) in zip(chunks, chunks[1:]):
+            assert m_prev["row_offset"] + m_prev["num_rows"] == m_next["row_offset"]
+
+    def test_row_offset_single_chunk_whole_file(self, tmp_path):
+        p = str(tmp_path / "d.parquet")
+        size = _write_parquet_with_row_groups(p, num_row_groups=4, rows_per_group=10)
+        chunker = ParquetFileChunker(target_chunk_size=10 * 1024**3)  # one chunk
+        chunks = list(chunker.generate_chunk_metadatas(p, size))
+        assert len(chunks) == 1
+        assert chunks[0][0]["row_offset"] == 0
 
     def test_ranges_are_contiguous_and_cover_all_row_groups(self, tmp_path):
         """Bundled ranges partition [0, num_row_groups) with no gaps/overlap."""
@@ -365,6 +404,7 @@ def test_chunk_metadata_subclasses_are_typeddicts():
         row_group_end=1,
         in_memory_size=42,
         num_rows=5,
+        row_offset=0,
     )
     lmd: ChunkMetadata = create_chunk_metadata(
         LineDelimitedFileChunkMetadata,
@@ -376,6 +416,7 @@ def test_chunk_metadata_subclasses_are_typeddicts():
         "row_group_end",
         "in_memory_size",
         "num_rows",
+        "row_offset",
     }
     assert set(lmd.keys()) == {"chunk_byte_start_idx", "chunk_byte_end_idx"}
 

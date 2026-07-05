@@ -9,6 +9,7 @@ import os
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from ray.data._internal.datasource_v2.chunkers.file_chunker import (
     ParquetFileChunker,
@@ -32,6 +33,7 @@ from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
 from ray.data._internal.datasource_v2.scanners.parquet_scanner import (
     ParquetScanner,
 )
+from ray.data.context import DataContext
 from ray.data.datasource.partitioning import Partitioning, PartitionStyle
 
 
@@ -248,19 +250,22 @@ def test_fragments_to_read_coalesces_sister_chunks(tmp_path):
     (fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
 
     # Two adjacent row-group chunks of the same file: [0, 2) and [2, 4).
+    # Each row group is 10 rows, so chunk_b's rows start at offset 20.
     chunk_a = create_chunk_metadata(
         ParquetFileChunkMetadata,
         row_group_start=0,
         row_group_end=2,
         in_memory_size=0,
-        num_rows=0,
+        num_rows=20,
+        row_offset=0,
     )
     chunk_b = create_chunk_metadata(
         ParquetFileChunkMetadata,
         row_group_start=2,
         row_group_end=4,
         in_memory_size=0,
-        num_rows=0,
+        num_rows=20,
+        row_offset=20,
     )
     frags = fragments_to_read_for_manifest(
         {fragment.path: fragment},
@@ -291,7 +296,8 @@ def test_fragments_to_read_groups_by_file(tmp_path):
                 row_group_start=0,
                 row_group_end=4,
                 in_memory_size=0,
-                num_rows=0,
+                num_rows=40,
+                row_offset=0,
             )
         )
     frags = fragments_to_read_for_manifest(path_to_fragment, paths, metas)
@@ -311,6 +317,183 @@ def test_fragments_to_read_whole_file_chunk_passes_through(tmp_path):
     )
     assert len(frags) == 1
     assert frags[0][1] == 0
+
+
+class _NoMetadataAccessFragment:
+    """Wraps a real fragment; raises if ``.metadata`` is ever explicitly
+    accessed at the Python level. ``.subset()`` is forwarded unmodified to the
+    real fragment -- its own internal footer fetch (confirmed to bypass this
+    Cython property entirely) is unaffected, so this proves the *default*
+    ``fragments_to_read_for_manifest`` path never needs an explicit
+    ``fragment.metadata`` access for offset computation."""
+
+    def __init__(self, real_fragment):
+        self._real = real_fragment
+        self.path = real_fragment.path
+
+    @property
+    def metadata(self):
+        raise AssertionError(
+            "fragment.metadata was accessed -- the default path must not "
+            "need a fresh footer read for row-offset computation."
+        )
+
+    def subset(self, **kwargs):
+        return self._real.subset(**kwargs)
+
+
+def test_fragments_to_read_uses_stamped_row_offset_not_footer(tmp_path):
+    """Default path resolves offsets purely from stamped metadata -- no
+    explicit ``fragment.metadata`` access."""
+    import pyarrow.dataset as pds
+
+    file_path = str(tmp_path / "multi.parquet")
+    _write_multi_row_group_parquet(file_path, num_rows=100, row_group_size=10)
+    (real_fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
+    guarded_fragment = _NoMetadataAccessFragment(real_fragment)
+
+    chunk = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=2,
+        row_group_end=4,
+        in_memory_size=0,
+        num_rows=20,
+        row_offset=20,
+    )
+    frags = fragments_to_read_for_manifest(
+        {guarded_fragment.path: guarded_fragment},
+        [guarded_fragment.path],
+        [chunk],
+    )
+    assert len(frags) == 1
+    sub, offset = frags[0]
+    assert offset == 20
+    assert len(sub.row_groups) == 2
+
+
+def test_fragments_to_read_offset_lookup_for_coalesced_runs_with_different_starts(
+    tmp_path,
+):
+    """3 adjacent chunks (each with its own stamped ``row_offset``) coalesce
+    into ONE contiguous run; the resulting sub-fragment must use the FIRST
+    chunk's offset, not the last or a re-derived value."""
+    import pyarrow.dataset as pds
+
+    file_path = str(tmp_path / "multi.parquet")
+    # 6 row groups x 10 rows each.
+    _write_multi_row_group_parquet(file_path, num_rows=60, row_group_size=10)
+    (fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
+
+    chunks = [
+        create_chunk_metadata(
+            ParquetFileChunkMetadata,
+            row_group_start=start,
+            row_group_end=start + 1,
+            in_memory_size=0,
+            num_rows=10,
+            row_offset=start * 10,
+        )
+        for start in (2, 3, 4)
+    ]
+    frags = fragments_to_read_for_manifest(
+        {fragment.path: fragment},
+        [fragment.path] * 3,
+        chunks,
+    )
+    assert len(frags) == 1  # all 3 adjacent chunks coalesce into one run
+    sub, offset = frags[0]
+    assert offset == 20  # the FIRST chunk's (row_group_start=2) row_offset
+    assert len(sub.row_groups) == 3
+
+
+def test_fragments_to_read_duplicate_identical_chunk_rows_same_start(tmp_path):
+    """Two identical (row_group_start, row_offset) chunk rows for the same
+    file don't crash and resolve to the (matching) offset."""
+    import pyarrow.dataset as pds
+
+    file_path = str(tmp_path / "multi.parquet")
+    _write_multi_row_group_parquet(file_path, num_rows=40, row_group_size=10)
+    (fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
+
+    chunk = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=1,
+        row_group_end=2,
+        in_memory_size=0,
+        num_rows=10,
+        row_offset=10,
+    )
+    frags = fragments_to_read_for_manifest(
+        {fragment.path: fragment},
+        [fragment.path, fragment.path],
+        [chunk, chunk],
+    )
+    assert len(frags) == 1
+    sub, offset = frags[0]
+    assert offset == 10
+    assert len(sub.row_groups) == 1
+
+
+def test_fragments_to_read_validate_against_footer_flag_reverts(tmp_path):
+    """``validate_against_footer=True`` ignores the stamped ``row_offset``
+    entirely and re-derives it from a fresh footer read -- a stronger proof
+    than "doesn't crash": deliberately stamp a WRONG offset and confirm the
+    flag produces the CORRECT footer-derived value instead."""
+    import pyarrow.dataset as pds
+
+    file_path = str(tmp_path / "multi.parquet")
+    _write_multi_row_group_parquet(file_path, num_rows=40, row_group_size=10)
+    (fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
+
+    # Deliberately wrong: the true offset for row_group_start=2 is 20.
+    chunk = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=2,
+        row_group_end=3,
+        in_memory_size=0,
+        num_rows=10,
+        row_offset=9999,
+    )
+
+    default_frags = fragments_to_read_for_manifest(
+        {fragment.path: fragment}, [fragment.path], [chunk]
+    )
+    assert default_frags[0][1] == 9999  # trusts the (wrong) stamped value
+
+    reverted_frags = fragments_to_read_for_manifest(
+        {fragment.path: fragment},
+        [fragment.path],
+        [chunk],
+        validate_against_footer=True,
+    )
+    assert reverted_frags[0][1] == 20  # re-derived correctly from the footer
+
+
+def test_fragments_to_read_missing_file_raises_at_subset(tmp_path):
+    """A file deleted between fragment discovery and
+    ``fragments_to_read_for_manifest`` still raises -- the (unavoidable)
+    footer fetch that used to happen via the removed explicit
+    ``fragment.metadata`` call now happens inside ``.subset()`` instead, same
+    exception surface, no loss of error detection."""
+    import pyarrow.dataset as pds
+
+    file_path = str(tmp_path / "vanishing.parquet")
+    _write_multi_row_group_parquet(file_path, num_rows=20, row_group_size=10)
+    (fragment,) = pds.dataset(file_path, format="parquet").get_fragments()
+    os.remove(file_path)
+
+    chunk = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=0,
+        row_group_end=1,
+        in_memory_size=0,
+        num_rows=10,
+        row_offset=0,
+    )
+    with pytest.raises(Exception):
+        fragments_to_read_for_manifest(
+            {fragment.path: fragment}, [fragment.path], [chunk]
+        )
 
 
 def _read_via_reader(reader, manifest):
@@ -414,12 +597,17 @@ def test_parquet_file_reader_chunked_row_hashes_are_unique(tmp_path):
     ), "row_hash must be unique across chunked sub-fragments of one file"
 
 
-def test_parquet_file_reader_handles_out_of_range_chunks(tmp_path):
-    """Defensively clamped out-of-range chunk metadata yields no rows, no crash.
+def test_parquet_file_reader_out_of_range_chunks_raise_by_default(tmp_path):
+    """A hand-constructed out-of-range chunk now raises by default.
 
     The chunker never emits out-of-range ranges (they're computed from the
-    same footer the reader sees), but a hand-constructed range beyond the
-    file's row groups must be handled gracefully.
+    same footer the reader sees), so this only matters for a hand-constructed
+    manifest, or a file whose row-group count shrinks between listing and
+    reading. Trading the old silent clamp-and-skip for a loud failure is an
+    intentional, documented consequence of trusting listing-time-derived
+    ranges by default (see ``_row_group_range_for_chunk``'s docstring) --
+    ``validate_against_footer=True`` restores the old graceful behavior (see
+    the companion test below).
     """
     file_path = str(tmp_path / "tiny.parquet")
     # 5 rows, single row group.
@@ -433,6 +621,36 @@ def test_parquet_file_reader_handles_out_of_range_chunks(tmp_path):
         row_group_end=4,
         in_memory_size=0,
         num_rows=0,
+        row_offset=0,
+    )
+    manifest = FileManifest.construct_manifest([file_path], [file_size], [out_of_range])
+
+    reader = ParquetFileReader()
+    with pytest.raises(pa.ArrowIndexError):
+        list(reader.read(manifest))
+
+
+def test_parquet_file_reader_out_of_range_chunks_clamped_with_validate_flag(
+    tmp_path, monkeypatch
+):
+    """``validate_against_footer=True`` (the rollback flag) restores the old
+    defensive clamp-and-skip behavior for out-of-range chunk metadata."""
+    monkeypatch.setattr(
+        DataContext.get_current(),
+        "parquet_validate_chunk_ranges_at_read_time",
+        True,
+    )
+    file_path = str(tmp_path / "tiny.parquet")
+    _write_multi_row_group_parquet(file_path, num_rows=5, row_group_size=5)
+    file_size = os.path.getsize(file_path)
+
+    out_of_range = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=3,
+        row_group_end=4,
+        in_memory_size=0,
+        num_rows=0,
+        row_offset=0,
     )
     manifest = FileManifest.construct_manifest([file_path], [file_size], [out_of_range])
 

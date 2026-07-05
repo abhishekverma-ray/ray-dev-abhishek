@@ -149,6 +149,45 @@ def test_read_parquet_v2_shuffle_with_multi_row_group_files_reads_all_rows(
     assert read_ids == sorted(expected_ids)
 
 
+def test_read_parquet_v2_row_hashes_identical_across_footer_validation_flag(
+    tmp_path, restore_ctx, monkeypatch
+):
+    # Regression test for the read-time footer-fetch elimination: row hashes
+    # (which depend on each chunk's file-row offset) must be byte-identical
+    # whether the offset comes from the listing-time-stamped value (default)
+    # or a freshly re-derived footer read (validate_against_footer=True).
+    # Multiple small, multi-row-group files land in one FileAffinityPartitioner
+    # pack, exercising the coalesced-run offset lookup end to end.
+    num_files = 5
+    rows_per_file = 20
+    for i in range(num_files):
+        ids = list(range(i * rows_per_file, (i + 1) * rows_per_file))
+        # row_group_size=5 -> 4 row groups per file, so chunks can be bundled.
+        pq.write_table(
+            pa.table({"id": ids}),
+            str(tmp_path / f"f{i}.parquet"),
+            row_group_size=5,
+        )
+
+    restore_ctx.use_datasource_v2 = True
+
+    def _read_id_to_hash():
+        ds = ray.data.read_parquet(str(tmp_path), include_row_hash=True)
+        return {r["id"]: r["row_hash"] for r in ds.iter_rows()}
+
+    default_result = _read_id_to_hash()
+    assert len(default_result) == num_files * rows_per_file
+
+    monkeypatch.setattr(
+        DataContext.get_current(),
+        "parquet_validate_chunk_ranges_at_read_time",
+        True,
+    )
+    reverted_result = _read_id_to_hash()
+
+    assert default_result == reverted_result
+
+
 def test_read_parquet_v2_hive_partitioned(tmp_path, restore_ctx):
     for p in ["a", "b"]:
         d = tmp_path / f"color={p}"

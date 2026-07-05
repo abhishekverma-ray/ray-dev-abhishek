@@ -156,6 +156,19 @@ DEFAULT_LIST_FILES_EXPAND_NUM_WORKERS = env_integer(
     "RAY_DATA_LIST_FILES_EXPAND_NUM_WORKERS", 4
 )
 
+# When True, the V2 Parquet reader re-derives each chunk's row-group range and
+# file-row offset from a FRESH footer read at read time (a defensive clamp
+# against fragment.metadata.num_row_groups, plus a full row-count prefix-sum
+# walk) instead of trusting the values ParquetFileChunker already stamped into
+# the manifest at listing time. This restores the pre-optimization
+# double-footer-read behavior (one footer read at listing, one again at read
+# time) -- a rollback switch in case listing-time-derived ranges/offsets are
+# ever found to be stale relative to the file actually read (e.g. the file
+# changed between listing and reading). Env-overridable.
+DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME = env_bool(
+    "RAY_DATA_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME", False
+)
+
 DEFAULT_ACTOR_PREFETCHER_ENABLED = False
 
 DEFAULT_USE_PUSH_BASED_SHUFFLE = bool(
@@ -616,6 +629,13 @@ class DataContext:
             size reaches this target (always at least one row group per chunk),
             so normal-sized row groups map roughly 1:1 to chunks. When ``None``,
             falls back to ``target_min_block_size``.
+        parquet_validate_chunk_ranges_at_read_time: When True, the V2 Parquet
+            reader re-derives each chunk's row-group range and file-row offset
+            from a fresh footer read at read time instead of trusting the
+            values ``ParquetFileChunker`` stamped into the manifest at listing
+            time. Defaults to False (footer read once, at listing time). Set
+            to True to restore the pre-optimization double-footer-read
+            behavior, e.g. if files can change between listing and reading.
         enable_tensor_extension_casting: Whether to automatically cast NumPy ndarray
             columns in Pandas DataFrames to tensor extension columns.
         arrow_fixed_shape_tensor_format: The tensor format to use for fixed-shape tensors.
@@ -888,6 +908,12 @@ class DataContext:
     # ``RAY_DATA_PARQUET_IN_MEMORY_VAR_WIDTH_FACTOR``.
     parquet_in_memory_var_width_factor: float = (
         DEFAULT_PARQUET_IN_MEMORY_VAR_WIDTH_FACTOR
+    )
+    # Kill switch: re-derive V2 Parquet chunk row-group ranges/offsets from a
+    # fresh footer read at read time instead of trusting listing-time-stamped
+    # values. See DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME.
+    parquet_validate_chunk_ranges_at_read_time: bool = (
+        DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME
     )
     # Max in-memory bytes per read partition. Defaults to 256 MiB; None ->
     # target_max_block_size.

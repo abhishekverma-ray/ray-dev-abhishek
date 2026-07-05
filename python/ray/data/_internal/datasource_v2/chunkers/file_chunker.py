@@ -82,12 +82,20 @@ class ParquetFileChunkMetadata(ChunkMetadata):
     summed from the footer. It lets ``Dataset.count()`` answer from the
     manifest without reading any data columns (see
     ``Dataset._try_count_from_manifest``).
+
+    ``row_offset`` is the number of rows in the file that precede
+    ``row_group_start`` (i.e. the file-row index of this chunk's first row).
+    It lets the reader seed row-hash offsets -- and, when sister chunks of the
+    same file are coalesced into one contiguous-run scan, resolve the run's
+    row offset -- without re-reading the footer at read time (see
+    ``fragments_to_read_for_manifest``).
     """
 
     row_group_start: int  # inclusive
     row_group_end: int  # exclusive
     in_memory_size: int  # footer-derived Arrow in-memory estimate (bytes)
     num_rows: int  # exact rows in [row_group_start, row_group_end), from footer
+    row_offset: int  # rows in the file strictly before row_group_start
 
 
 def estimate_chunk_in_memory_size(
@@ -332,6 +340,7 @@ class ParquetFileChunker(FileChunker):
             on_disk_size: int,
             rows: int,
             uncompressed_by_column: Dict[str, int],
+            row_offset: int,
         ):
             # When the footer schema is unavailable, fall back to the on-disk
             # (compressed) bytes scaled by the encoding ratio so the stamped
@@ -353,6 +362,7 @@ class ParquetFileChunker(FileChunker):
                     row_group_end=end,
                     in_memory_size=in_memory,
                     num_rows=rows,
+                    row_offset=row_offset,
                 ),
                 on_disk_size,
             )
@@ -370,6 +380,12 @@ class ParquetFileChunker(FileChunker):
         running_compressed_size = 0
         running_rows = 0
         running_uncompressed: Dict[str, int] = defaultdict(int)
+        # Cumulative rows across ALL row groups seen so far in the file
+        # (never reset) and the value it held when the current bundle
+        # started -- captured once per bundle to stamp ``row_offset`` without
+        # a second pass or any extra footer access.
+        total_rows_seen = 0
+        bundle_row_offset = 0
         for rg_idx in range(num_row_groups):
             rg_meta = metadata.row_group(rg_idx)
             rg_compressed_size = 0
@@ -392,14 +408,17 @@ class ParquetFileChunker(FileChunker):
                     running_compressed_size,
                     running_rows,
                     running_uncompressed,
+                    bundle_row_offset,
                 )
                 start = rg_idx
                 running_compressed_size = 0
                 running_rows = 0
                 running_uncompressed = defaultdict(int)
+                bundle_row_offset = total_rows_seen
 
             running_compressed_size += rg_compressed_size
             running_rows += rg_meta.num_rows
+            total_rows_seen += rg_meta.num_rows
             for root, uncompressed in rg_uncompressed.items():
                 running_uncompressed[root] += uncompressed
 
@@ -410,4 +429,5 @@ class ParquetFileChunker(FileChunker):
             running_compressed_size,
             running_rows,
             running_uncompressed,
+            bundle_row_offset,
         )
