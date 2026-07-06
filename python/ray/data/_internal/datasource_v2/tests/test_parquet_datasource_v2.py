@@ -115,6 +115,23 @@ def test_get_size_estimator_returns_footer_derived(tmp_path):
     )
 
 
+def test_sampling_indexer_skips_row_group_chunker(tmp_path):
+    # Schema-inference sampling only needs file paths, so it must use a
+    # metadata-free WholeFileChunker rather than the row-group-aware
+    # ParquetFileChunker (whose per-column footer accounting is
+    # O(row_groups x columns) and dominates wide-schema reads at plan time).
+    # Execution-time listing still uses the real ParquetFileChunker.
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+
+    sampling_indexer = datasource._get_sampling_file_indexer()
+    assert isinstance(sampling_indexer.file_chunker, WholeFileChunker)
+    assert sampling_indexer.file_chunker.reads_file_metadata is False
+
+    execution_indexer = datasource._get_file_indexer()
+    assert isinstance(execution_indexer.file_chunker, ParquetFileChunker)
+    assert execution_indexer.file_chunker.reads_file_metadata is True
+
+
 def test_paths_and_filesystem_resolved(tmp_path):
     file_path = tmp_path / "data.parquet"
     _write_parquet(str(file_path), pa.table({"a": [1]}))

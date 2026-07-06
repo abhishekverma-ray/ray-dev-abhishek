@@ -136,6 +136,17 @@ class DataSourceV2(ABC, Generic[InputSplit]):
         """
         return None
 
+    def _get_sampling_file_indexer(self) -> Optional[FileIndexer]:
+        """Return a FileIndexer to use for driver-side schema-inference sampling.
+
+        Defaults to the same indexer as execution. File-based sources whose
+        listing indexer reads per-file metadata (e.g. Parquet footers for
+        row-group-aware chunking) should override this to return a cheaper,
+        metadata-free indexer -- schema inference only needs file paths, so the
+        expensive per-file metadata reads are pure waste at sampling time.
+        """
+        return self._get_file_indexer()
+
     def get_size_estimator(self) -> Optional[InMemorySizeEstimator]:
         """Return size estimator for this datasource.
 
