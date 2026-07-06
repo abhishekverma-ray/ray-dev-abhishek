@@ -25,11 +25,15 @@ def _write(path, table):
 @pytest.fixture
 def restore_ctx():
     ctx = DataContext.get_current()
-    original = ctx.use_datasource_v2
+    original_use_datasource_v2 = ctx.use_datasource_v2
+    original_read_op_min_num_blocks = ctx.read_op_min_num_blocks
+    original_cap_enabled = ctx.read_files_estimated_num_outputs_cap_enabled
     try:
         yield ctx
     finally:
-        ctx.use_datasource_v2 = original
+        ctx.use_datasource_v2 = original_use_datasource_v2
+        ctx.read_op_min_num_blocks = original_read_op_min_num_blocks
+        ctx.read_files_estimated_num_outputs_cap_enabled = original_cap_enabled
 
 
 def test_v2_flag_default():
@@ -162,6 +166,11 @@ def test_read_parquet_v2_estimated_num_outputs(tmp_path, restore_ctx):
     assert target_max_block_size is not None
 
     # Real estimate present -> ceil(size_bytes_estimate / target_max_block_size).
+    # 10MB is deliberately small enough that ceil(...) stays under the
+    # CPU-aware cap (max(read_op_min_num_blocks, 2*avail_cpus)) added in
+    # ``_cap_against_cpu_ceiling`` under any realistic cluster size, so this
+    # case exercises the uncapped formula. See
+    # test_read_parquet_v2_estimated_num_outputs_cpu_cap for the cap itself.
     with_estimate = dataclasses.replace(read_files, size_bytes_estimate=10_000_000)
     assert with_estimate.estimated_num_outputs() == math.ceil(
         10_000_000 / target_max_block_size
@@ -180,6 +189,79 @@ def test_read_parquet_v2_estimated_num_outputs(tmp_path, restore_ctx):
         read_files, num_outputs=42, size_bytes_estimate=10_000_000
     )
     assert explicit.estimated_num_outputs() == 42
+
+
+def test_read_parquet_v2_estimated_num_outputs_cpu_cap(
+    tmp_path, restore_ctx, monkeypatch
+):
+    # Regression test for a live release-test regression: on fixed-size
+    # (non-autoscaling) clusters, the raw byte-size-driven estimate ran far
+    # ahead of what CPU count would justify (SF1000 TPC-H q1:
+    # num_partitions=2195 on V2 vs. 1000 on V1 for the same table/cluster),
+    # making V2's hash-aggregate 1.24x-2.4x slower wall-clock than V1 on
+    # those clusters (autoscaling clusters have slack to absorb it; fixed
+    # ones don't). ``estimated_num_outputs()`` now caps the byte-size
+    # estimate against V1's own ``max(read_op_min_num_blocks, 2*avail_cpus)``
+    # ceiling from ``_autodetect_parallelism()``.
+    import dataclasses
+    import math
+
+    _write(tmp_path / "f0.parquet", pa.table({"a": list(range(1000))}))
+    restore_ctx.use_datasource_v2 = True
+    ds = ray.data.read_parquet(str(tmp_path))
+    read_files = ds._logical_plan.dag
+
+    target_max_block_size = DataContext.get_current().target_max_block_size
+    assert target_max_block_size is not None
+    restore_ctx.read_op_min_num_blocks = 200
+
+    huge = dataclasses.replace(
+        read_files, size_bytes_estimate=10_000 * target_max_block_size
+    )
+    raw_huge_estimate = math.ceil(
+        (10_000 * target_max_block_size) / target_max_block_size
+    )
+
+    def set_avail_cpus(n):
+        monkeypatch.setattr(
+            "ray.data._internal.util._estimate_available_parallelism", lambda: n
+        )
+
+    # Small byte estimate stays well under the ceiling -> uncapped.
+    set_avail_cpus(4)
+    small = dataclasses.replace(read_files, size_bytes_estimate=10_000_000)
+    assert small.estimated_num_outputs() == math.ceil(
+        10_000_000 / target_max_block_size
+    )
+
+    # Huge byte estimate + small avail_cpus -> capped to
+    # max(read_op_min_num_blocks=200, 2*4) == 200.
+    assert huge.estimated_num_outputs() == 200
+
+    # Tiny-CPU cluster: the read_op_min_num_blocks floor still holds -- the
+    # cap never suppresses the estimate below V1's own default floor.
+    set_avail_cpus(1)
+    assert huge.estimated_num_outputs() == 200
+
+    # Large-CPU cluster: the CPU term (2*avail_cpus) binds once it exceeds
+    # the read_op_min_num_blocks floor.
+    set_avail_cpus(500)
+    assert huge.estimated_num_outputs() == 1000
+
+    # CPU detection failure -> fail open, raw uncapped estimate.
+    def _raise():
+        raise RuntimeError("no cluster")
+
+    monkeypatch.setattr(
+        "ray.data._internal.util._estimate_available_parallelism", _raise
+    )
+    assert huge.estimated_num_outputs() == raw_huge_estimate
+
+    # Kill switch disabled -> uncapped even on a tiny-CPU cluster.
+    set_avail_cpus(1)
+    restore_ctx.read_files_estimated_num_outputs_cap_enabled = False
+    assert huge.estimated_num_outputs() == raw_huge_estimate
+    restore_ctx.read_files_estimated_num_outputs_cap_enabled = True
 
 
 def test_read_parquet_v2_shuffle_files_randomizes_row_order(tmp_path, restore_ctx):

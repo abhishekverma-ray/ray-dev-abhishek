@@ -169,6 +169,14 @@ DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME = env_bool(
     "RAY_DATA_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME", False
 )
 
+# Kill switch: cap ReadFiles.estimated_num_outputs()'s byte-size-driven estimate
+# against a CPU-aware ceiling (max(read_op_min_num_blocks, 2 * avail_cpus), the same
+# floor/CPU terms _autodetect_parallelism() uses for V1's own read parallelism).
+# Rollback switch in case the cap itself is ever wrong for some workload.
+DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED = env_bool(
+    "RAY_DATA_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED", True
+)
+
 DEFAULT_ACTOR_PREFETCHER_ENABLED = False
 
 DEFAULT_USE_PUSH_BASED_SHUFFLE = bool(
@@ -636,6 +644,13 @@ class DataContext:
             time. Defaults to False (footer read once, at listing time). Set
             to True to restore the pre-optimization double-footer-read
             behavior, e.g. if files can change between listing and reading.
+        read_files_estimated_num_outputs_cap_enabled: When True (the default),
+            ``ReadFiles.estimated_num_outputs()``'s byte-size-driven estimate is
+            capped against ``max(read_op_min_num_blocks, 2 * avail_cpus)`` -- the
+            same floor/CPU terms V1's ``_autodetect_parallelism()`` uses -- so a
+            hash-shuffle stage sized from this estimate never proposes more
+            partitions than the cluster's CPU count would justify. Set to False
+            to restore the uncapped byte-size-only estimate.
         enable_tensor_extension_casting: Whether to automatically cast NumPy ndarray
             columns in Pandas DataFrames to tensor extension columns.
         arrow_fixed_shape_tensor_format: The tensor format to use for fixed-shape tensors.
@@ -914,6 +929,11 @@ class DataContext:
     # values. See DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME.
     parquet_validate_chunk_ranges_at_read_time: bool = (
         DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME
+    )
+    # Kill switch: cap ReadFiles.estimated_num_outputs()'s byte-size-driven estimate
+    # against a CPU-aware ceiling. See DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED.
+    read_files_estimated_num_outputs_cap_enabled: bool = (
+        DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED
     )
     # Max in-memory bytes per read partition. Defaults to 256 MiB; None ->
     # target_max_block_size.

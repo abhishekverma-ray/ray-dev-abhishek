@@ -353,6 +353,16 @@ class ReadFiles(
         coarser, which (combined with the flat encoding-ratio bug fixed
         above) was enough to push a hash-aggregate's requested memory past
         total cluster memory and hang.
+
+        The raw byte-size-driven estimate is also capped against a CPU-aware
+        ceiling (see ``_cap_against_cpu_ceiling``) before being returned --
+        V1's own estimate is CPU-count-driven, not byte-size-driven, and on a
+        fixed (non-autoscaling) cluster this cap matters: confirmed via live
+        release-test logs, a byte-size-only estimate can run far ahead of
+        what CPU count justifies (SF1000 TPC-H q1: V2 resolved
+        ``num_partitions=2195`` vs. V1's ``1000`` for the same table/cluster),
+        costing real wall-clock time on clusters with no autoscaling slack to
+        absorb the over-partitioning.
         """
         if self.num_outputs is not None:
             return self.num_outputs
@@ -363,7 +373,32 @@ class ReadFiles(
         target_max_block_size = DataContext.get_current().target_max_block_size
         if target_max_block_size is None:
             return None
-        return math.ceil(self.size_bytes_estimate / target_max_block_size)
+        estimate = math.ceil(self.size_bytes_estimate / target_max_block_size)
+        return self._cap_against_cpu_ceiling(estimate)
+
+    def _cap_against_cpu_ceiling(self, estimate: int) -> int:
+        """Cap ``estimate`` against ``max(read_op_min_num_blocks, 2 * avail_cpus)`` --
+        the same floor/CPU terms ``_autodetect_parallelism()`` uses to bound V1's own
+        auto-detected read parallelism. Confirmed via live release-test logs that
+        without this cap, V2's byte-size-driven estimate can run far ahead of what
+        cluster CPU count would justify on non-autoscaling clusters (SF1000 TPC-H q1:
+        num_partitions=2195 on V2 vs. 1000 on V1 for the same table/cluster; a
+        groupby benchmark: 217 vs. 100), costing 1.24x-2.4x wall-clock time on those
+        clusters (autoscaling clusters have slack to absorb the over-partitioning
+        instead). Never raises: fails open (returns ``estimate`` uncapped) if CPU
+        detection fails or the cap is disabled via the kill switch.
+        """
+        ctx = DataContext.get_current()
+        if not ctx.read_files_estimated_num_outputs_cap_enabled:
+            return estimate
+        from ray.data._internal.util import _estimate_available_parallelism
+
+        try:
+            avail_cpus = _estimate_available_parallelism()
+        except Exception:
+            return estimate
+        ceiling = max(ctx.read_op_min_num_blocks, 2 * avail_cpus)
+        return min(estimate, ceiling)
 
     def supports_projection_pushdown(self) -> bool:
         from ray.data._internal.datasource_v2.logical_optimizers import (
