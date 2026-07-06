@@ -77,6 +77,9 @@ def fragments_to_read_for_manifest(
     ``FileAffinityPartitioner``) collapse into a single sub-fragment per run, so
     the reader opens the file once and streams those row groups sequentially.
     Whole-file chunks (``None`` metadata) pass through as the full fragment.
+    Distinct paths are emitted in the order they first appear in ``paths``,
+    so a partition mixing whole-file and chunked entries preserves the
+    manifest's original arrival order (needed for ``preserve_order``).
 
     By default (``validate_against_footer=False``), each run's file-row offset
     comes directly from the listing-time-stamped ``row_offset`` on whichever
@@ -88,7 +91,7 @@ def fragments_to_read_for_manifest(
     revert to a fresh, footer-derived prefix sum instead (ignores the stamped
     ``row_offset`` entirely).
     """
-    whole_file_paths: List[str] = []
+    whole_file_paths: Set[str] = set()
     path_to_row_groups: Dict[str, Set[int]] = defaultdict(set)
     # Per-path map from a chunk's (post-clamp) row-group start to its
     # listing-time-stamped row_offset. A contiguous run's first row-group id
@@ -98,9 +101,14 @@ def fragments_to_read_for_manifest(
     # below -- even when multiple chunks of one file are unioned together
     # (e.g. by ``FileAffinityPartitioner``).
     path_to_offset_by_start: Dict[str, Dict[int, int]] = defaultdict(dict)
+    arrival_order: List[str] = []
+    seen_paths: Set[str] = set()
     for path, chunk_metadata in zip(paths, chunk_metadatas):
+        if path not in seen_paths:
+            seen_paths.add(path)
+            arrival_order.append(path)
         if chunk_metadata is None:
-            whole_file_paths.append(path)
+            whole_file_paths.add(path)
             continue
         rng = _row_group_range_for_chunk(
             path_to_fragment[path],
@@ -112,9 +120,13 @@ def fragments_to_read_for_manifest(
             path_to_offset_by_start[path][rng[0]] = chunk_metadata["row_offset"]
 
     fragments: List[Tuple[pds.ParquetFileFragment, int]] = []
-    for path in whole_file_paths:
-        fragments.append((path_to_fragment[path], 0))
-    for path, row_groups in path_to_row_groups.items():
+    for path in arrival_order:
+        if path in whole_file_paths:
+            fragments.append((path_to_fragment[path], 0))
+            continue
+        row_groups = path_to_row_groups.get(path)
+        if not row_groups:
+            continue
         fragment = path_to_fragment[path]
         if validate_against_footer:
             # Full revert: re-derive row_offsets from a fresh footer read,

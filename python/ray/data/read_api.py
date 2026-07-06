@@ -429,9 +429,17 @@ def _resolve_read_remote_args(
     )
 
 
+# Shared with the ``sample_files(..., max_files=...)`` call below so the two
+# can't silently drift apart -- ``_estimate_v2_read_size_bytes`` needs to know
+# whether the sample it's given was truncated by this exact cap.
+_SCHEMA_INFERENCE_SAMPLE_MAX_FILES = 16
+
+
 def _estimate_v2_read_size_bytes(
     datasource,
     sample: "FileManifest",
+    *,
+    sample_max_files: int = _SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
 ) -> Optional[int]:
     """Best-effort in-memory size estimate for a V2 read, or ``None``.
 
@@ -455,6 +463,14 @@ def _estimate_v2_read_size_bytes(
     recursive ``FileSelector`` call per input path, not a per-directory
     walk. Returns ``None`` (today's behavior, safe) on any failure -- this
     estimate must never break a read.
+
+    ``sample_max_files`` must match the ``max_files`` the caller passed to
+    ``sample_files(...)`` to build ``sample`` -- it's used to tell whether
+    ``sample`` is the exact, complete (pruning-aware) manifest or was
+    truncated by its own row cap. ``sample`` rows are per-*chunk*, not
+    per-file (a multi-row-group file contributes multiple rows), so
+    comparing a raw file count against ``len(sample)`` would incorrectly
+    treat a truncated multi-chunk sample as exact.
     """
     from ray.data._internal.datasource_v2.listing.indexing_utils import (
         _get_file_infos,
@@ -480,10 +496,13 @@ def _estimate_v2_read_size_bytes(
     if total_files == 0:
         return None
 
-    # If the full listing found fewer (or exactly as many) files as the
-    # schema-inference sample already covers, the sample's sizes ARE the
-    # exact total -- no extrapolation needed.
-    if total_files <= len(sample):
+    # ``sample`` was capped at ``sample_max_files`` *rows* (chunks), not
+    # files. If the underlying listing exhausted before hitting that cap,
+    # ``len(sample) < sample_max_files`` and the sample is the exact,
+    # complete (pruning-aware) manifest -- use its sizes directly. Otherwise
+    # the sample may be missing some of a chunked file's rows (or whole
+    # files), so fall back to the full (unpruned) listing's total.
+    if len(sample) < sample_max_files:
         on_disk_bytes = int(sample.file_sizes.sum())
     else:
         on_disk_bytes = total_on_disk_bytes
@@ -558,7 +577,13 @@ def _read_datasource_v2(
 
     # Sample a few files for schema inference. Listed again (cheaply) during
     # execution inside the ListFiles op — no caching layer needed.
-    sample = sample_files(indexer, datasource.paths, datasource.filesystem, pruners)
+    sample = sample_files(
+        indexer,
+        datasource.paths,
+        datasource.filesystem,
+        pruners,
+        max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
+    )
     if len(sample) == 0:
         raise ValueError(
             f"no files found under {datasource.paths!r}. Check the path and any "

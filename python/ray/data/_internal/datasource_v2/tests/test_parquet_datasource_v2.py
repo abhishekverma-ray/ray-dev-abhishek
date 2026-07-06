@@ -313,6 +313,66 @@ def _write_multi_row_group_parquet(path, num_rows: int, row_group_size: int):
     return table
 
 
+def test_estimate_v2_read_size_bytes_uses_full_listing_when_sample_is_truncated(
+    tmp_path,
+):
+    """A single file with more row-group chunks than the schema-inference
+    sample's row cap must not be treated as "sample is exact": the sample
+    would only cover a prefix of the file's chunks, so summing its
+    (per-chunk) sizes silently under-counts the file's true on-disk size.
+    The estimate must fall back to the full (unpruned) listing's total.
+    """
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
+    )
+    from ray.data.read_api import (
+        _SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
+        _estimate_v2_read_size_bytes,
+    )
+
+    file_path = str(tmp_path / "many_row_groups.parquet")
+    num_row_groups = _SCHEMA_INFERENCE_SAMPLE_MAX_FILES + 4
+    _write_multi_row_group_parquet(file_path, num_rows=num_row_groups, row_group_size=1)
+
+    ctx = DataContext.get_current()
+    prior_target = ctx.parquet_chunker_target_chunk_size
+    # Force ~one chunk per row group so this single file produces more
+    # manifest rows (chunks) than the schema-inference sample's row cap.
+    ctx.parquet_chunker_target_chunk_size = 1
+    try:
+        datasource = ParquetDatasourceV2([str(tmp_path)])
+        indexer = datasource._get_file_indexer()
+        sample = sample_files(
+            indexer,
+            datasource.paths,
+            datasource.filesystem,
+            [],
+            max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
+        )
+        # Sample truncated by its own row cap -- not exact/complete.
+        assert len(sample) == _SCHEMA_INFERENCE_SAMPLE_MAX_FILES
+
+        estimate = _estimate_v2_read_size_bytes(
+            datasource,
+            sample,
+            sample_max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
+        )
+        expected = int(
+            os.path.getsize(file_path) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+        )
+        assert estimate == expected
+
+        # The buggy file-count-vs-row-count comparison would have used the
+        # truncated sample's sum instead, silently under-counting.
+        truncated_estimate = int(
+            int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+        )
+        assert truncated_estimate < expected
+    finally:
+        ctx.parquet_chunker_target_chunk_size = prior_target
+
+
 def test_fragments_to_read_coalesces_sister_chunks(tmp_path):
     """Sister chunks of one file collapse into a single contiguous-run scan."""
     import pyarrow.dataset as pds
@@ -389,6 +449,47 @@ def test_fragments_to_read_whole_file_chunk_passes_through(tmp_path):
     )
     assert len(frags) == 1
     assert frags[0][1] == 0
+
+
+def test_fragments_to_read_preserves_manifest_arrival_order(tmp_path):
+    """A partition mixing a chunked file and a whole-file chunk must emit
+    fragments in the manifest's arrival order, not whole-file-first
+    regardless of order (the prior behavior)."""
+    import pyarrow.dataset as pds
+
+    chunked_path = str(tmp_path / "z_chunked.parquet")
+    _write_multi_row_group_parquet(chunked_path, num_rows=20, row_group_size=10)
+    (chunked_fragment,) = pds.dataset(chunked_path, format="parquet").get_fragments()
+
+    whole_path = str(tmp_path / "a_whole.parquet")
+    _write_multi_row_group_parquet(whole_path, num_rows=10, row_group_size=10)
+    (whole_fragment,) = pds.dataset(whole_path, format="parquet").get_fragments()
+
+    chunk = create_chunk_metadata(
+        ParquetFileChunkMetadata,
+        row_group_start=0,
+        row_group_end=2,
+        in_memory_size=0,
+        num_rows=20,
+        row_offset=0,
+    )
+    path_to_fragment = {
+        chunked_fragment.path: chunked_fragment,
+        whole_fragment.path: whole_fragment,
+    }
+    # Chunked file arrives FIRST, whole-file chunk SECOND, and the whole-file
+    # path also sorts alphabetically before the chunked path -- so neither
+    # arrival order nor alphabetical order would accidentally coincide with
+    # the old "all whole-file fragments first" behavior.
+    frags = fragments_to_read_for_manifest(
+        path_to_fragment,
+        [chunked_fragment.path, whole_fragment.path],
+        [chunk, None],
+    )
+    assert [sub.path for sub, _ in frags] == [
+        chunked_fragment.path,
+        whole_fragment.path,
+    ]
 
 
 class _NoMetadataAccessFragment:
