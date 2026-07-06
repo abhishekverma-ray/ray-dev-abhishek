@@ -140,6 +140,48 @@ def test_read_parquet_v2_infer_metadata_size_bytes_propagates_through_project(
     assert dag.infer_metadata().size_bytes == read_files_size_bytes
 
 
+def test_read_parquet_v2_estimated_num_outputs(tmp_path, restore_ctx):
+    # Regression test for a live SF1000 TPC-H hang: without a real
+    # ``estimated_num_outputs()``, ``ReadFiles`` (via the inherited base
+    # implementation, which walks up to ``ListFiles`` and finds no
+    # ``num_outputs`` either) always returned ``None`` -- so any downstream
+    # op that "matches upstream block count" when the caller doesn't specify
+    # one (e.g. ``HashShufflingOperatorBase``'s ``target_num_partitions``)
+    # fell back to a fixed default (200) regardless of how large the read
+    # actually is. V1's equivalent (``Read._estimate_num_outputs()``) is
+    # size-derived; this mirrors that formula exactly.
+    import dataclasses
+    import math
+
+    _write(tmp_path / "f0.parquet", pa.table({"a": list(range(1000))}))
+    restore_ctx.use_datasource_v2 = True
+    ds = ray.data.read_parquet(str(tmp_path))
+    read_files = ds._logical_plan.dag
+
+    target_max_block_size = DataContext.get_current().target_max_block_size
+    assert target_max_block_size is not None
+
+    # Real estimate present -> ceil(size_bytes_estimate / target_max_block_size).
+    with_estimate = dataclasses.replace(read_files, size_bytes_estimate=10_000_000)
+    assert with_estimate.estimated_num_outputs() == math.ceil(
+        10_000_000 / target_max_block_size
+    )
+
+    # No estimate -> None, the safe fallback (unchanged from today).
+    without_estimate = dataclasses.replace(read_files, size_bytes_estimate=None)
+    assert without_estimate.estimated_num_outputs() is None
+
+    # Empty dataset -> 0, not None (mirrors V1's zero-size edge case).
+    empty = dataclasses.replace(read_files, size_bytes_estimate=0)
+    assert empty.estimated_num_outputs() == 0
+
+    # An explicit ``num_outputs`` always wins over the size-derived estimate.
+    explicit = dataclasses.replace(
+        read_files, num_outputs=42, size_bytes_estimate=10_000_000
+    )
+    assert explicit.estimated_num_outputs() == 42
+
+
 def test_read_parquet_v2_shuffle_files_randomizes_row_order(tmp_path, restore_ctx):
     # Regression test: FileAffinityPartitioner.finalize() used to sort emitted
     # partitions by path "for determinism," which silently discarded any

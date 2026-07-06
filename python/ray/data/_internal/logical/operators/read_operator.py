@@ -337,6 +337,34 @@ class ReadFiles(
         """
         return BlockMetadata(None, self.size_bytes_estimate, None, None)
 
+    def estimated_num_outputs(self) -> Optional[int]:
+        """Estimate output block count from ``size_bytes_estimate``, mirroring
+        ``Read._estimate_num_outputs()``'s formula for the legacy V1 path.
+
+        Without this override, the inherited base implementation falls
+        through to ``ListFiles`` (which also has no ``num_outputs``) and
+        returns ``None`` unconditionally -- forcing any downstream consumer
+        that "matches upstream block count" when no explicit value is given
+        (e.g. ``HashShufflingOperatorBase``'s ``target_num_partitions``
+        resolution) onto a fixed, scale-blind default instead of a real,
+        size-derived one. Confirmed via a live A/B at SF1000: V1's
+        equivalent estimate resolves ``num_partitions=1000`` for the same
+        ``lineitem`` table, V2's static default gives ``200`` -- five times
+        coarser, which (combined with the flat encoding-ratio bug fixed
+        above) was enough to push a hash-aggregate's requested memory past
+        total cluster memory and hang.
+        """
+        if self.num_outputs is not None:
+            return self.num_outputs
+        if self.size_bytes_estimate == 0:
+            return 0
+        if self.size_bytes_estimate is None:
+            return None
+        target_max_block_size = DataContext.get_current().target_max_block_size
+        if target_max_block_size is None:
+            return None
+        return math.ceil(self.size_bytes_estimate / target_max_block_size)
+
     def supports_projection_pushdown(self) -> bool:
         from ray.data._internal.datasource_v2.logical_optimizers import (
             SupportsColumnPruning,

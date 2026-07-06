@@ -455,6 +455,18 @@ def _estimate_v2_read_size_bytes(
     relative to V1, plausibly causing over-dense aggregator scheduling and a
     long tail).
 
+    Rather than a flat on-disk-to-in-memory ratio, this uses the sample's own
+    footer-derived, type-aware in-memory sizes (the same
+    ``datasource.get_size_estimator()`` used for partition-bucket sizing) to
+    derive a ratio specific to this dataset's actual columns -- a flat
+    constant (e.g. 5x) can overshoot badly for schemas dominated by
+    fixed-width columns (ints, decimals, dates), which is exactly what
+    ``lineitem``-shaped TPC-H tables look like (confirmed: a live A/B at SF1000
+    showed the flat 5x ratio inflating the estimate to ~1.68x the real,
+    footer-derived size V1 measures for the same data, which combined with a
+    too-small ``num_partitions`` to make a hash-aggregate's per-aggregator
+    memory request exceed total cluster memory and hang).
+
     Lists every file's on-disk size directly (not just the schema-inference
     sample) -- this is a full, but NOT pruning-aware (partition_filter /
     file_extensions aren't applied), directory listing; it may slightly
@@ -475,9 +487,6 @@ def _estimate_v2_read_size_bytes(
     from ray.data._internal.datasource_v2.listing.indexing_utils import (
         _get_file_infos,
     )
-    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
-        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
-    )
 
     try:
         total_on_disk_bytes = 0
@@ -496,18 +505,31 @@ def _estimate_v2_read_size_bytes(
     if total_files == 0:
         return None
 
+    try:
+        sample_in_memory_bytes = float(
+            datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
+        )
+    except Exception as e:
+        logger.debug("Failed to estimate V2 read size from the sample: %s", e)
+        return None
+
     # ``sample`` was capped at ``sample_max_files`` *rows* (chunks), not
     # files. If the underlying listing exhausted before hitting that cap,
     # ``len(sample) < sample_max_files`` and the sample is the exact,
-    # complete (pruning-aware) manifest -- use its sizes directly. Otherwise
+    # complete (pruning-aware) manifest -- its footer-derived in-memory sum
+    # already IS the exact total, no ratio/extrapolation needed. Otherwise
     # the sample may be missing some of a chunked file's rows (or whole
-    # files), so fall back to the full (unpruned) listing's total.
+    # files), so extrapolate: derive this dataset's real encoding ratio from
+    # the sample, then apply it to the full (unpruned) listing's on-disk
+    # total.
     if len(sample) < sample_max_files:
-        on_disk_bytes = int(sample.file_sizes.sum())
-    else:
-        on_disk_bytes = total_on_disk_bytes
+        return int(sample_in_memory_bytes)
 
-    return int(on_disk_bytes * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT)
+    sample_on_disk_bytes = float(sample.file_sizes.sum())
+    if sample_on_disk_bytes <= 0:
+        return None
+    ratio = sample_in_memory_bytes / sample_on_disk_bytes
+    return int(total_on_disk_bytes * ratio)
 
 
 @wrap_auto_init

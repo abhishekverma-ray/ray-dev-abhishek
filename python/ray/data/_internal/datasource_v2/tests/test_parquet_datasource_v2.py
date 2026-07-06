@@ -273,11 +273,8 @@ def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
 def test_estimate_v2_read_size_bytes_exact_when_sample_covers_all_files(tmp_path):
     # With <= 16 files (the schema-inference sample cap), the sample already
     # covers the whole dataset, so the estimate should use the sample's own
-    # exact on-disk sizes rather than extrapolating.
+    # exact footer-derived in-memory sizes directly -- no ratio/extrapolation.
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
-    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
-        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
-    )
     from ray.data.read_api import _estimate_v2_read_size_bytes
 
     for i in range(3):
@@ -292,9 +289,45 @@ def test_estimate_v2_read_size_bytes_exact_when_sample_covers_all_files(tmp_path
 
     estimate = _estimate_v2_read_size_bytes(datasource, sample)
     expected = int(
-        int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+        datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
     )
     assert estimate == expected
+
+
+def test_estimate_v2_read_size_bytes_uses_footer_ratio_not_flat_default(tmp_path):
+    # Regression test for a live SF1000 TPC-H hang: a flat on-disk-to-
+    # in-memory ratio (5x) overshoots badly for fixed-width-heavy schemas
+    # (ints, floats, decimals, dates) -- exactly what TPC-H's ``lineitem``
+    # looks like -- inflating the estimate enough that a downstream
+    # hash-aggregate's per-aggregator memory request exceeded total cluster
+    # memory and hung. The estimate must use the sample's real,
+    # footer-derived in-memory sizes instead of guessing a flat ratio.
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
+    )
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    # A fixed-width, mostly-numeric schema -- the real encoding ratio for
+    # this kind of data is materially smaller than the flat 5x default.
+    table = pa.table(
+        {
+            "a": list(range(100_000)),
+            "b": [float(i) for i in range(100_000)],
+        }
+    )
+    _write_parquet(str(tmp_path / "f0.parquet"), table)
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    indexer = datasource._get_file_indexer()
+    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+    assert len(sample) == 1
+
+    estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    flat_ratio_estimate = int(
+        int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+    )
+    assert estimate < flat_ratio_estimate
 
 
 def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
@@ -340,9 +373,6 @@ def test_estimate_v2_read_size_bytes_uses_full_listing_when_sample_is_truncated(
     The estimate must fall back to the full (unpruned) listing's total.
     """
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
-    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
-        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
-    )
     from ray.data.read_api import (
         _SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
         _estimate_v2_read_size_bytes,
@@ -375,17 +405,22 @@ def test_estimate_v2_read_size_bytes_uses_full_listing_when_sample_is_truncated(
             sample,
             sample_max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
         )
-        expected = int(
-            os.path.getsize(file_path) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+
+        # Extrapolation should apply the sample's own footer-derived ratio to
+        # the FULL file's on-disk size (not just the truncated sample's).
+        sample_in_memory_bytes = float(
+            datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
         )
+        sample_on_disk_bytes = float(sample.file_sizes.sum())
+        ratio = sample_in_memory_bytes / sample_on_disk_bytes
+        expected = int(os.path.getsize(file_path) * ratio)
         assert estimate == expected
 
-        # The buggy file-count-vs-row-count comparison would have used the
-        # truncated sample's sum instead, silently under-counting.
-        truncated_estimate = int(
-            int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
-        )
-        assert truncated_estimate < expected
+        # The buggy file-count-vs-row-count comparison would have treated the
+        # truncated sample as exact and used its (smaller) in-memory sum
+        # directly instead of extrapolating over the full file.
+        truncated_only_estimate = int(sample_in_memory_bytes)
+        assert truncated_only_estimate < expected
     finally:
         ctx.parquet_chunker_target_chunk_size = prior_target
 
