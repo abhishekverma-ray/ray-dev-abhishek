@@ -277,6 +277,14 @@ class ReadFiles(
     # ``LimitPushdownRule._apply_per_block_limit_if_supported``), not this field.
     per_block_limit: Optional[int] = field(init=False, default=None)
     num_outputs: Optional[int] = None
+    # Best-effort in-memory size estimate for the whole read, or ``None`` if
+    # unavailable. Computed once, driver-side, in ``_read_datasource_v2``
+    # (see ``_estimate_v2_read_size_bytes``) and surfaced via
+    # ``infer_metadata().size_bytes`` -- the only signal hash-shuffle/join
+    # aggregator memory sizing (``_try_estimate_output_bytes``),
+    # ``set_read_parallelism``, and ``Dataset.size_bytes()`` have for a V2
+    # read, which otherwise always see ``None``.
+    size_bytes_estimate: Optional[int] = None
     _name: str = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -313,15 +321,21 @@ class ReadFiles(
         return schema
 
     def infer_metadata(self) -> BlockMetadata:
-        """Return empty metadata; downstream callers fall back to materialization.
+        """Return metadata with a best-effort ``size_bytes``, everything else
+        empty; downstream callers needing an exact count/row-level detail
+        still fall back to materialization.
 
-        Prior ``ReadFiles`` versions reached into a driver-side file cache to
-        compute size hints. With listing owned by an upstream
-        ``ListFiles`` op, metadata-for-sizing is computed from the
-        materialized manifest at execution time — the logical op doesn't
-        try to pre-estimate.
+        ``num_rows``/``exec_stats``/``input_files`` are genuinely unknown at
+        plan time -- listing is owned by an upstream ``ListFiles`` op, and
+        that per-chunk detail is only available from the materialized
+        manifest at execution time. ``size_bytes`` is different: it's cheap
+        to approximate driver-side (see ``size_bytes_estimate`` /
+        ``_estimate_v2_read_size_bytes`` in ``read_api.py``), and several
+        consumers (hash-shuffle/join aggregator memory sizing, read-time
+        parallelism sizing, ``Dataset.size_bytes()``) treat a bare V2 read's
+        permanently-``None`` size as a real gap, not a graceful no-op.
         """
-        return BlockMetadata(None, None, None, None)
+        return BlockMetadata(None, self.size_bytes_estimate, None, None)
 
     def supports_projection_pushdown(self) -> bool:
         from ray.data._internal.datasource_v2.logical_optimizers import (

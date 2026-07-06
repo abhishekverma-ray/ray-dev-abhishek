@@ -89,6 +89,57 @@ def test_read_parquet_builds_list_files_read_files_chain(tmp_path, restore_ctx):
     assert "b" in schema.names
 
 
+def test_read_parquet_v2_infer_metadata_size_bytes_is_populated(tmp_path, restore_ctx):
+    # Regression test: a bare V2 ReadFiles used to always report
+    # infer_metadata().size_bytes=None, which forces hash-shuffle/join
+    # aggregator memory sizing onto an online sample that can severely
+    # under-estimate early in execution (confirmed via a live A/B run: V2
+    # underestimated a dataset's size by ~9x relative to V1 for the same
+    # query, plausibly causing a long tail). A real, non-None (if
+    # approximate) size estimate should be available at plan time.
+    for i in range(5):
+        _write(tmp_path / f"f{i}.parquet", pa.table({"a": list(range(1000))}))
+
+    restore_ctx.use_datasource_v2 = True
+    ds = ray.data.read_parquet(str(tmp_path))
+
+    meta = ds._logical_plan.dag.infer_metadata()
+    assert meta.size_bytes is not None
+    assert meta.size_bytes > 0
+
+    # Dataset.size_bytes() is a downstream consumer of this same signal.
+    assert ds.size_bytes() is not None
+    assert ds.size_bytes() > 0
+
+
+def test_read_parquet_v2_infer_metadata_size_bytes_propagates_through_project(
+    tmp_path, restore_ctx
+):
+    # The fix's actual target: HashAggregate/Join sit behind a `Project` in
+    # the real logical chain (e.g. from column-projection pushdown).
+    # `Project.infer_metadata()` (a one-to-one op with
+    # can_modify_num_rows=False) only forwards `size_bytes` from its input
+    # when that input actually has one -- this locks in that a V2 read's
+    # estimate survives that hop, which is exactly what
+    # `_try_estimate_output_bytes` (hash_shuffle.py) reads.
+    for i in range(5):
+        _write(
+            tmp_path / f"f{i}.parquet", pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        )
+
+    restore_ctx.use_datasource_v2 = True
+    with pytest.warns(DeprecationWarning, match="`columns=` on `read_parquet`"):
+        ds = ray.data.read_parquet(str(tmp_path), columns=["a"])
+
+    from ray.data._internal.logical.operators.map_operator import Project
+
+    dag = ds._logical_plan.dag
+    assert isinstance(dag, Project)
+    read_files_size_bytes = dag.input_dependencies[0].infer_metadata().size_bytes
+    assert read_files_size_bytes is not None
+    assert dag.infer_metadata().size_bytes == read_files_size_bytes
+
+
 def test_read_parquet_v2_shuffle_files_randomizes_row_order(tmp_path, restore_ctx):
     # Regression test: FileAffinityPartitioner.finalize() used to sort emitted
     # partitions by path "for determinism," which silently discarded any

@@ -235,6 +235,78 @@ def test_datasource_accepts_custom_chunker(tmp_path):
     assert indexer.file_chunker is custom
 
 
+def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    for i in range(5):
+        _write_parquet(
+            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(1000))})
+        )
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    indexer = datasource._get_file_indexer()
+    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+
+    estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    assert estimate is not None
+    assert estimate > 0
+
+
+def test_estimate_v2_read_size_bytes_exact_when_sample_covers_all_files(tmp_path):
+    # With <= 16 files (the schema-inference sample cap), the sample already
+    # covers the whole dataset, so the estimate should use the sample's own
+    # exact on-disk sizes rather than extrapolating.
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
+    )
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    for i in range(3):
+        _write_parquet(
+            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(100))})
+        )
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    indexer = datasource._get_file_indexer()
+    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+    assert len(sample) == 3  # sample cap (16) not hit; covers the whole dataset
+
+    estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    expected = int(
+        int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+    )
+    assert estimate == expected
+
+
+def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
+    tmp_path, monkeypatch
+):
+    # Must never raise -- this is a best-effort signal, not a correctness
+    # requirement, and a failure here must not break the read.
+    from ray.data import read_api
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+
+    _write_parquet(str(tmp_path / "f0.parquet"), pa.table({"a": [1, 2, 3]}))
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    indexer = datasource._get_file_indexer()
+    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+
+    def _raise(*args, **kwargs):
+        raise OSError("simulated listing failure")
+
+    # `_estimate_v2_read_size_bytes` does a local import of `_get_file_infos`
+    # from this module, so patching it here is what actually takes effect.
+    import ray.data._internal.datasource_v2.listing.indexing_utils as indexing_utils
+
+    monkeypatch.setattr(indexing_utils, "_get_file_infos", _raise)
+
+    estimate = read_api._estimate_v2_read_size_bytes(datasource, sample)
+    assert estimate is None
+
+
 def _write_multi_row_group_parquet(path, num_rows: int, row_group_size: int):
     table = pa.table({"id": list(range(num_rows))})
     pq.write_table(table, path, row_group_size=row_group_size)

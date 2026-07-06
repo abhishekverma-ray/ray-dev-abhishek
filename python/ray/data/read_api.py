@@ -136,6 +136,7 @@ if TYPE_CHECKING:
     from pyiceberg.expressions import BooleanExpression
     from tensorflow_metadata.proto.v0 import schema_pb2
 
+    from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
     from ray.data.catalog import Catalog
 
 T = TypeVar("T")
@@ -428,6 +429,68 @@ def _resolve_read_remote_args(
     )
 
 
+def _estimate_v2_read_size_bytes(
+    datasource,
+    sample: "FileManifest",
+) -> Optional[int]:
+    """Best-effort in-memory size estimate for a V2 read, or ``None``.
+
+    Used to populate ``ReadFiles.infer_metadata().size_bytes`` so downstream
+    consumers (hash-shuffle/join aggregator memory sizing via
+    ``_try_estimate_output_bytes``, ``set_read_parallelism``,
+    ``Dataset.size_bytes()``) get a real signal instead of always seeing
+    ``None`` -- V2's logical ``ReadFiles`` op previously never estimated
+    size at all, which forces hash-shuffle sizing onto an online sample that
+    can severely under-estimate early in execution for a shuffle fed
+    directly by a read (confirmed: a live A/B run of the same query showed
+    V2's aggregator memory sizing under-estimate a dataset's size by ~9x
+    relative to V1, plausibly causing over-dense aggregator scheduling and a
+    long tail).
+
+    Lists every file's on-disk size directly (not just the schema-inference
+    sample) -- this is a full, but NOT pruning-aware (partition_filter /
+    file_extensions aren't applied), directory listing; it may slightly
+    overcount for datasets that prune many files, which is an acceptable
+    trade-off for a best-effort sizing signal. Cheap because it's a single
+    recursive ``FileSelector`` call per input path, not a per-directory
+    walk. Returns ``None`` (today's behavior, safe) on any failure -- this
+    estimate must never break a read.
+    """
+    from ray.data._internal.datasource_v2.listing.indexing_utils import (
+        _get_file_infos,
+    )
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
+    )
+
+    try:
+        total_on_disk_bytes = 0
+        total_files = 0
+        for path in datasource.paths:
+            for _file_path, file_size in _get_file_infos(
+                path, datasource.filesystem, ignore_missing_path=True
+            ):
+                if file_size is not None:
+                    total_on_disk_bytes += file_size
+                total_files += 1
+    except Exception as e:
+        logger.debug("Failed to estimate V2 read size from a full file listing: %s", e)
+        return None
+
+    if total_files == 0:
+        return None
+
+    # If the full listing found fewer (or exactly as many) files as the
+    # schema-inference sample already covers, the sample's sizes ARE the
+    # exact total -- no extrapolation needed.
+    if total_files <= len(sample):
+        on_disk_bytes = int(sample.file_sizes.sum())
+    else:
+        on_disk_bytes = total_on_disk_bytes
+
+    return int(on_disk_bytes * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT)
+
+
 @wrap_auto_init
 def _read_datasource_v2(
     datasource,
@@ -519,6 +582,14 @@ def _read_datasource_v2(
         partitioning=resolved_partitioning,
     )
 
+    # Best-effort in-memory size estimate for ReadFiles.infer_metadata() --
+    # see _estimate_v2_read_size_bytes's docstring for why this matters
+    # (hash-shuffle/join aggregator memory sizing has no other signal for a
+    # V2 read and otherwise relies on an online sample that can severely
+    # under-estimate early in execution). None is a safe fallback: it
+    # reproduces today's behavior exactly.
+    size_bytes_estimate = _estimate_v2_read_size_bytes(datasource, sample)
+
     # File-affinity bucketing for the listing output. The partitioner is
     # captured in a pickled closure and runs inside worker tasks, so its
     # estimator must be I/O-free and pickle-safe — use the datasource's
@@ -584,6 +655,7 @@ def _read_datasource_v2(
         compute=compute_strategy,
         block_udf=block_udf,
         input_dependencies=[list_files_op],
+        size_bytes_estimate=size_bytes_estimate,
     )
 
     stats = DatasetStats(metadata={"ReadFiles": []}, parent=None)
