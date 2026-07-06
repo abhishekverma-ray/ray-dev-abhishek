@@ -592,12 +592,10 @@ def _read_datasource_v2(
 
     indexer = datasource._get_file_indexer()
 
-    # execution inside the ListFiles op — no caching layer needed. Use the
-    # datasource's *sampling* indexer, which skips any per-file metadata reads
-    # (e.g. Parquet footer / row-group chunking) that schema inference doesn't
-    # need — that work happens distributed inside ``ListFiles`` at execution.
+    # Sample a few files for schema inference. Listed again (cheaply) during
+    # execution inside the ListFiles op — no caching layer needed.
     sample = sample_files(
-        datasource._get_sampling_file_indexer(),
+        indexer,
         datasource.paths,
         datasource.filesystem,
         pruners,

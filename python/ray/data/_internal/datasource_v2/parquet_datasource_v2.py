@@ -21,7 +21,6 @@ from ray.data._internal.datasource.parquet_datasource import (
 from ray.data._internal.datasource_v2.chunkers.file_chunker import (
     FileChunker,
     ParquetFileChunker,
-    WholeFileChunker,
 )
 from ray.data._internal.datasource_v2.datasource_v2 import (
     DatasourceCategory,
@@ -152,19 +151,6 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         return NonSamplingFileIndexer(
             ignore_missing_paths=self._ignore_missing_paths,
             file_chunker=self._file_chunker,
-        )
-
-    def _get_sampling_file_indexer(self) -> FileIndexer:
-        # Driver-side schema inference (``infer_schema`` / ``resolve_partitioning``)
-        # consumes only the sampled file *paths* -- it re-reads each file's footer
-        # itself and never touches per-chunk metadata. Sample with a
-        # ``WholeFileChunker`` (``reads_file_metadata=False``) so sampling skips the
-        # row-group-aware ``ParquetFileChunker``'s per-column footer accounting,
-        # which is O(row_groups x columns) and dominates wide-schema reads at plan
-        # time. The real chunker still runs, distributed, inside ``ListFiles``.
-        return NonSamplingFileIndexer(
-            ignore_missing_paths=self._ignore_missing_paths,
-            file_chunker=WholeFileChunker(),
         )
 
     def get_size_estimator(self) -> InMemorySizeEstimator:
