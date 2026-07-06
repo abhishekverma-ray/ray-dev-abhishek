@@ -31,39 +31,46 @@ def _expand_directory(
     base_path: str,
     filesystem: pa.fs.FileSystem,
     ignore_missing_path: bool,
-    *,
-    _root_path: Optional[str] = None,
 ) -> Iterable[Tuple[str, Optional[int]]]:
+    """Recursively list ``base_path``, pruning ``.``/``_``-prefixed entries.
+
+    A single recursive ``FileSelector`` call (one logical, internally-
+    paginated listing operation) rather than a manual walk that issues one
+    non-recursive call per directory level -- the latter costs one network
+    round-trip per subdirectory, which is serial and can dominate wall-clock
+    for datasets with many subdirectories (e.g. per-class folders). Mirrors
+    the equivalent, already-proven V1 helper at
+    ``ray.data.datasource.file_meta_provider._expand_directory``.
+    """
     exclude_prefixes = [".", "_"]
 
-    if _root_path is None:
-        _root_path = base_path
-
     selector = FileSelector(
-        base_path, recursive=False, allow_not_found=ignore_missing_path
+        base_path, recursive=True, allow_not_found=ignore_missing_path
     )
     files = filesystem.get_file_info(selector)
 
     assert isinstance(files, list), type(files)
-    files.sort(key=lambda file_: file_.path)
+    base_dir = selector.base_dir
 
+    out = []
     for file_ in files:
-        if not file_.path.startswith(_root_path):
+        if not file_.path.startswith(base_dir):
             continue
 
-        relative = file_.path[len(_root_path) :].lstrip("/")
+        relative = file_.path[len(base_dir) :].lstrip("/")
         if any(relative.startswith(prefix) for prefix in exclude_prefixes):
             continue
 
         if file_.type == FileType.File:
-            yield (file_.path, file_.size)
+            out.append((file_.path, file_.size))
         elif file_.type == FileType.Directory:
-            yield from _expand_directory(
-                file_.path, filesystem, ignore_missing_path, _root_path=_root_path
-            )
+            continue
         elif file_.type == FileType.UNKNOWN:
             logger.warning(f"Discovered file with unknown type: '{file_.path}'")
             continue
         else:
             assert file_.type == FileType.NotFound
             raise FileNotFoundError(file_.path)
+
+    out.sort(key=lambda item: item[0])
+    yield from out
