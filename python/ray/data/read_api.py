@@ -20,6 +20,7 @@ from typing import (
 import numpy as np
 
 import ray
+from ray._common.utils import env_integer
 from ray._private.auto_init_hook import wrap_auto_init
 from ray.data._internal.compute import ComputeStrategy
 from ray.data._internal.datasource.audio_datasource import AudioDatasource
@@ -431,7 +432,9 @@ def _resolve_read_remote_args(
 
 
 # Cap on how many files the schema-inference sample below covers.
-_SCHEMA_INFERENCE_SAMPLE_MAX_FILES = 16
+_SCHEMA_INFERENCE_SAMPLE_MAX_FILES = env_integer(
+    "RAY_DATA_SCHEMA_INFERENCE_SAMPLE_MAX_FILES", 16
+)
 
 
 def _estimate_v2_read_size_bytes(

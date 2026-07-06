@@ -308,13 +308,37 @@
 
   matrix:
     setup:
-      data_type: [primitives, tensors, objects, nested_structs]
+      data_type: [primitives, objects, nested_structs]
 
   run:
     timeout: 300
     script: >
       python wide_schema_pipeline_benchmark.py
       --data-type {{data_type}}
+
+# The tensors variant is broken out of the matrix so it can lower the
+# schema-inference file sample cap to 2 (default is 16).
+- name: wide_schema_pipeline_tensors
+  python: "3.10"
+  cluster:
+    anyscale_sdk_2026: true
+    byod:
+      runtime_env:
+        # Preserve the default verbose stats for resource manager.
+        - RAY_DATA_DEBUG_RESOURCE_MANAGER=1
+        - RAYTEST_FAIL_ON_WORKER_OOM=1
+        - RAYTEST_FAIL_ON_DEAD_NODES=1
+        - RAYTEST_FAIL_ON_SPILLING=1
+        # S3 tensor data was written by Ray 2.49-2.54 using cloudpickle.
+        - RAY_DATA_AUTOLOAD_CLOUDPICKLE_TENSOR_METADATA=1
+        - RAY_DATA_SCHEMA_INFERENCE_SAMPLE_MAX_FILES=2
+    cluster_compute: fixed_size_cpu_compute.yaml
+
+  run:
+    timeout: 300
+    script: >
+      python wide_schema_pipeline_benchmark.py
+      --data-type tensors
 
 #######################
 # Streaming split tests
