@@ -470,16 +470,32 @@ def _estimate_v2_read_size_bytes(
     hash-aggregate's per-aggregator memory request exceed total cluster
     memory and hang).
 
-    Deliberately does NOT use the sample's own chunk metadata for this (the
-    way an earlier version of this function did, via
-    ``ParquetFooterDerivedInMemorySizeEstimator``): schema-inference sampling
-    uses a metadata-free ``WholeFileChunker``
-    (``DataSourceV2._get_sampling_file_indexer()``) specifically to skip the
-    row-group-aware chunker's O(row_groups x columns) footer accounting,
-    which used to dominate wide-schema reads at plan time -- so the sample's
-    chunk metadata is always ``None`` here, and reading it for a ratio would
-    silently fall back to the exact flat-ratio behavior this function is
-    trying to avoid.
+    Does NOT trust the sample's own ``file_sizes`` as whole-file sizes: which
+    indexer schema-inference sampling uses varies (e.g. a metadata-free
+    whole-file chunker vs. the row-group-aware Parquet chunker), and for a
+    chunker that can emit multiple rows per file, a single sample row's size
+    is just one chunk's on-disk size, not the file's. Dividing a
+    fully-decoded file's in-memory size by one chunk's on-disk size skews
+    the ratio -- confirmed by review (a real bug): for a large
+    multi-row-group file, this could inflate the ratio by roughly that
+    file's row-group count. Normalizing the sample to one row per distinct
+    path, with the real whole-file size from the listing below (which is
+    chunker-independent -- it's a raw filesystem list, not a chunked read),
+    makes this function correct regardless of which chunker sampling uses.
+
+    Derives a real, per-dataset encoding ratio the same way V1's
+    ``ParquetDatasource`` does (``_estimate_files_encoding_ratio``): actually
+    read and decode one of the schema-inference sample's files via
+    ``SamplingInMemorySizeEstimator``, measure its real Arrow in-memory size
+    against its on-disk size, and apply that ratio to the full listing's
+    on-disk total. A flat ratio constant (e.g. the old 5x default) can
+    overshoot badly for schemas dominated by fixed-width columns (ints,
+    decimals, dates) -- exactly what ``lineitem``-shaped TPC-H tables look
+    like (confirmed: a live A/B at SF1000 showed a flat 5x ratio inflating
+    the estimate to ~1.68x the real, footer-derived size V1 measures for the
+    same data, which combined with a too-small ``num_partitions`` to make a
+    hash-aggregate's per-aggregator memory request exceed total cluster
+    memory and hang).
 
     Lists every file's on-disk size directly (not just the schema-inference
     sample) -- this is a full, but NOT pruning-aware (partition_filter /
@@ -490,6 +506,7 @@ def _estimate_v2_read_size_bytes(
     walk. Returns ``None`` (today's behavior, safe) on any failure -- this
     estimate must never break a read.
     """
+    from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
     from ray.data._internal.datasource_v2.listing.indexing_utils import (
         _get_file_infos,
     )
@@ -500,12 +517,14 @@ def _estimate_v2_read_size_bytes(
     try:
         total_on_disk_bytes = 0
         total_files = 0
+        path_to_full_size = {}
         for path in datasource.paths:
-            for _file_path, file_size in _get_file_infos(
+            for file_path, file_size in _get_file_infos(
                 path, datasource.filesystem, ignore_missing_path=True
             ):
                 if file_size is not None:
                     total_on_disk_bytes += file_size
+                    path_to_full_size[file_path] = file_size
                 total_files += 1
     except Exception as e:
         logger.debug("Failed to estimate V2 read size from a full file listing: %s", e)
@@ -514,16 +533,36 @@ def _estimate_v2_read_size_bytes(
     if total_files == 0:
         return None
 
+    # Normalize the sample to one row per distinct path with the real
+    # whole-file size (see the docstring above for why). Falls back to
+    # summing that path's own sample rows if it's somehow missing from the
+    # listing above (e.g. a sample/listing mismatch) rather than failing.
+    dedup_paths = []
+    dedup_sizes = []
+    seen_paths = set()
+    for path in sample.paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        full_size = path_to_full_size.get(path)
+        if full_size is None:
+            full_size = int(sample.file_sizes[sample.paths == path].sum())
+        dedup_paths.append(path)
+        dedup_sizes.append(full_size)
+    normalized_sample = FileManifest.construct_manifest(
+        dedup_paths, dedup_sizes, [None] * len(dedup_paths)
+    )
+
     try:
         sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
         sample_in_memory_bytes = float(
-            sample_estimator.estimate_in_memory_sizes(sample).sum()
+            sample_estimator.estimate_in_memory_sizes(normalized_sample).sum()
         )
     except Exception as e:
         logger.debug("Failed to estimate V2 read size from the sample: %s", e)
         return None
 
-    sample_on_disk_bytes = float(sample.file_sizes.sum())
+    sample_on_disk_bytes = float(normalized_sample.file_sizes.sum())
     if sample_on_disk_bytes <= 0:
         return None
     ratio = sample_in_memory_bytes / sample_on_disk_bytes

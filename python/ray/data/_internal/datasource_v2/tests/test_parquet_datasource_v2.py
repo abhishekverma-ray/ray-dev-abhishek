@@ -240,7 +240,7 @@ def _sample_and_scanner(datasource):
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
 
     sample = sample_files(
-        datasource._get_sampling_file_indexer(),
+        datasource._get_file_indexer(),
         datasource.paths,
         datasource.filesystem,
         [],
@@ -310,24 +310,27 @@ def test_estimate_v2_read_size_bytes_extrapolates_over_full_listing(tmp_path):
     )
     from ray.data.read_api import _estimate_v2_read_size_bytes
 
-    for i in range(5):
-        _write_parquet(
-            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(1000))})
-        )
+    paths = [str(tmp_path / f"f{i}.parquet") for i in range(5)]
+    for path in paths:
+        _write_parquet(path, pa.table({"a": list(range(1000))}))
 
     datasource = ParquetDatasourceV2([str(tmp_path)])
     sample, scanner = _sample_and_scanner(datasource)
 
     estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
 
-    total_on_disk_bytes = sum(
-        os.path.getsize(str(tmp_path / f"f{i}.parquet")) for i in range(5)
-    )
+    # Use real, filesystem-reported sizes throughout (the same source
+    # _estimate_v2_read_size_bytes itself uses for both the ratio and the
+    # full-listing total) -- a Parquet row group's chunk-derived byte size
+    # excludes file-level footer/overhead bytes, so `sample.file_sizes`
+    # doesn't exactly equal `os.path.getsize`.
+    whole_file_sample = _manifest_of(paths)
+    total_on_disk_bytes = int(whole_file_sample.file_sizes.sum())
     sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
     sample_in_memory_bytes = float(
-        sample_estimator.estimate_in_memory_sizes(sample).sum()
+        sample_estimator.estimate_in_memory_sizes(whole_file_sample).sum()
     )
-    ratio = sample_in_memory_bytes / float(sample.file_sizes.sum())
+    ratio = sample_in_memory_bytes / float(whole_file_sample.file_sizes.sum())
     expected = int(total_on_disk_bytes * ratio)
     assert estimate == expected
 
@@ -361,6 +364,47 @@ def _write_multi_row_group_parquet(path, num_rows: int, row_group_size: int):
     table = pa.table({"id": list(range(num_rows))})
     pq.write_table(table, path, row_group_size=row_group_size)
     return table
+
+
+def test_estimate_v2_read_size_bytes_normalizes_chunked_sample_to_whole_file(tmp_path):
+    # Regression test for a review-confirmed bug: when schema-inference
+    # sampling uses the row-group-aware chunker (rather than a metadata-free
+    # whole-file chunker), a single sample manifest row's on-disk size is
+    # just one row group's size, not the whole file's. Dividing the whole
+    # file's decoded in-memory size by one row group's on-disk size skews
+    # the ratio by roughly the file's row-group count. The estimate must be
+    # identical regardless of how many sample rows the chunker in use
+    # happens to produce for this file.
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        SamplingInMemorySizeEstimator,
+    )
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    file_path = tmp_path / "f0.parquet"
+    _write_multi_row_group_parquet(str(file_path), num_rows=1000, row_group_size=50)
+
+    # A tiny target_chunk_size forces the row-group-aware chunker to emit
+    # one sample row per row group instead of bundling them all into one --
+    # the premise this test exercises.
+    datasource = ParquetDatasourceV2(
+        [str(tmp_path)], file_chunker=ParquetFileChunker(target_chunk_size=1)
+    )
+    chunked_sample, scanner = _sample_and_scanner(datasource)
+    assert len(chunked_sample) > 1
+
+    estimate = _estimate_v2_read_size_bytes(datasource, chunked_sample, scanner)
+
+    # Independently compute the correct ratio from a single, whole-file row
+    # (what a metadata-free whole-file chunker's sample would look like).
+    whole_file_sample = _manifest_of([str(file_path)])
+    sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+    correct_in_memory_bytes = float(
+        sample_estimator.estimate_in_memory_sizes(whole_file_sample).sum()
+    )
+    correct_ratio = correct_in_memory_bytes / float(whole_file_sample.file_sizes.sum())
+    expected = int(os.path.getsize(str(file_path)) * correct_ratio)
+
+    assert estimate == expected
 
 
 def test_fragments_to_read_coalesces_sister_chunks(tmp_path):
