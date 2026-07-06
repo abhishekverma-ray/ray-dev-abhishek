@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     from tensorflow_metadata.proto.v0 import schema_pb2
 
     from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
+    from ray.data._internal.datasource_v2.scanners.scanner import Scanner
     from ray.data.catalog import Catalog
 
 T = TypeVar("T")
@@ -429,17 +430,14 @@ def _resolve_read_remote_args(
     )
 
 
-# Shared with the ``sample_files(..., max_files=...)`` call below so the two
-# can't silently drift apart -- ``_estimate_v2_read_size_bytes`` needs to know
-# whether the sample it's given was truncated by this exact cap.
+# Cap on how many files the schema-inference sample below covers.
 _SCHEMA_INFERENCE_SAMPLE_MAX_FILES = 16
 
 
 def _estimate_v2_read_size_bytes(
     datasource,
     sample: "FileManifest",
-    *,
-    sample_max_files: int = _SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
+    scanner: "Scanner",
 ) -> Optional[int]:
     """Best-effort in-memory size estimate for a V2 read, or ``None``.
 
@@ -455,17 +453,30 @@ def _estimate_v2_read_size_bytes(
     relative to V1, plausibly causing over-dense aggregator scheduling and a
     long tail).
 
-    Rather than a flat on-disk-to-in-memory ratio, this uses the sample's own
-    footer-derived, type-aware in-memory sizes (the same
-    ``datasource.get_size_estimator()`` used for partition-bucket sizing) to
-    derive a ratio specific to this dataset's actual columns -- a flat
-    constant (e.g. 5x) can overshoot badly for schemas dominated by
-    fixed-width columns (ints, decimals, dates), which is exactly what
-    ``lineitem``-shaped TPC-H tables look like (confirmed: a live A/B at SF1000
-    showed the flat 5x ratio inflating the estimate to ~1.68x the real,
-    footer-derived size V1 measures for the same data, which combined with a
-    too-small ``num_partitions`` to make a hash-aggregate's per-aggregator
-    memory request exceed total cluster memory and hang).
+    Derives a real, per-dataset encoding ratio the same way V1's
+    ``ParquetDatasource`` does (``_estimate_files_encoding_ratio``): actually
+    read and decode one of the schema-inference sample's files via
+    ``SamplingInMemorySizeEstimator``, measure its real Arrow in-memory size
+    against its on-disk size, and apply that ratio to the full listing's
+    on-disk total. A flat ratio constant (e.g. the old 5x default) can
+    overshoot badly for schemas dominated by fixed-width columns (ints,
+    decimals, dates) -- exactly what ``lineitem``-shaped TPC-H tables look
+    like (confirmed: a live A/B at SF1000 showed a flat 5x ratio inflating
+    the estimate to ~1.68x the real, footer-derived size V1 measures for the
+    same data, which combined with a too-small ``num_partitions`` to make a
+    hash-aggregate's per-aggregator memory request exceed total cluster
+    memory and hang).
+
+    Deliberately does NOT use the sample's own chunk metadata for this (the
+    way an earlier version of this function did, via
+    ``ParquetFooterDerivedInMemorySizeEstimator``): schema-inference sampling
+    uses a metadata-free ``WholeFileChunker``
+    (``DataSourceV2._get_sampling_file_indexer()``) specifically to skip the
+    row-group-aware chunker's O(row_groups x columns) footer accounting,
+    which used to dominate wide-schema reads at plan time -- so the sample's
+    chunk metadata is always ``None`` here, and reading it for a ratio would
+    silently fall back to the exact flat-ratio behavior this function is
+    trying to avoid.
 
     Lists every file's on-disk size directly (not just the schema-inference
     sample) -- this is a full, but NOT pruning-aware (partition_filter /
@@ -475,17 +486,12 @@ def _estimate_v2_read_size_bytes(
     recursive ``FileSelector`` call per input path, not a per-directory
     walk. Returns ``None`` (today's behavior, safe) on any failure -- this
     estimate must never break a read.
-
-    ``sample_max_files`` must match the ``max_files`` the caller passed to
-    ``sample_files(...)`` to build ``sample`` -- it's used to tell whether
-    ``sample`` is the exact, complete (pruning-aware) manifest or was
-    truncated by its own row cap. ``sample`` rows are per-*chunk*, not
-    per-file (a multi-row-group file contributes multiple rows), so
-    comparing a raw file count against ``len(sample)`` would incorrectly
-    treat a truncated multi-chunk sample as exact.
     """
     from ray.data._internal.datasource_v2.listing.indexing_utils import (
         _get_file_infos,
+    )
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        SamplingInMemorySizeEstimator,
     )
 
     try:
@@ -506,24 +512,13 @@ def _estimate_v2_read_size_bytes(
         return None
 
     try:
+        sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
         sample_in_memory_bytes = float(
-            datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
+            sample_estimator.estimate_in_memory_sizes(sample).sum()
         )
     except Exception as e:
         logger.debug("Failed to estimate V2 read size from the sample: %s", e)
         return None
-
-    # ``sample`` was capped at ``sample_max_files`` *rows* (chunks), not
-    # files. If the underlying listing exhausted before hitting that cap,
-    # ``len(sample) < sample_max_files`` and the sample is the exact,
-    # complete (pruning-aware) manifest -- its footer-derived in-memory sum
-    # already IS the exact total, no ratio/extrapolation needed. Otherwise
-    # the sample may be missing some of a chunked file's rows (or whole
-    # files), so extrapolate: derive this dataset's real encoding ratio from
-    # the sample, then apply it to the full (unpruned) listing's on-disk
-    # total.
-    if len(sample) < sample_max_files:
-        return int(sample_in_memory_bytes)
 
     sample_on_disk_bytes = float(sample.file_sizes.sum())
     if sample_on_disk_bytes <= 0:
@@ -637,7 +632,7 @@ def _read_datasource_v2(
     # V2 read and otherwise relies on an online sample that can severely
     # under-estimate early in execution). None is a safe fallback: it
     # reproduces today's behavior exactly.
-    size_bytes_estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    size_bytes_estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
 
     # File-affinity bucketing for the listing output. The partitioner is
     # captured in a pickled closure and runs inside worker tasks, so its

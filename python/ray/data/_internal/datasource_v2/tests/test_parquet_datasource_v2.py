@@ -252,8 +252,21 @@ def test_datasource_accepts_custom_chunker(tmp_path):
     assert indexer.file_chunker is custom
 
 
-def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
+def _sample_and_scanner(datasource):
+    """Mirror ``_read_datasource_v2``'s own sample+scanner construction."""
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+
+    sample = sample_files(
+        datasource._get_sampling_file_indexer(),
+        datasource.paths,
+        datasource.filesystem,
+        [],
+    )
+    scanner = datasource.create_scanner(datasource.infer_schema(sample))
+    return sample, scanner
+
+
+def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
     from ray.data.read_api import _estimate_v2_read_size_bytes
 
     for i in range(5):
@@ -262,47 +275,22 @@ def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
         )
 
     datasource = ParquetDatasourceV2([str(tmp_path)])
-    indexer = datasource._get_file_indexer()
-    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+    sample, scanner = _sample_and_scanner(datasource)
 
-    estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
     assert estimate is not None
     assert estimate > 0
 
 
-def test_estimate_v2_read_size_bytes_exact_when_sample_covers_all_files(tmp_path):
-    # With <= 16 files (the schema-inference sample cap), the sample already
-    # covers the whole dataset, so the estimate should use the sample's own
-    # exact footer-derived in-memory sizes directly -- no ratio/extrapolation.
-    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
-    from ray.data.read_api import _estimate_v2_read_size_bytes
-
-    for i in range(3):
-        _write_parquet(
-            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(100))})
-        )
-
-    datasource = ParquetDatasourceV2([str(tmp_path)])
-    indexer = datasource._get_file_indexer()
-    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
-    assert len(sample) == 3  # sample cap (16) not hit; covers the whole dataset
-
-    estimate = _estimate_v2_read_size_bytes(datasource, sample)
-    expected = int(
-        datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
-    )
-    assert estimate == expected
-
-
-def test_estimate_v2_read_size_bytes_uses_footer_ratio_not_flat_default(tmp_path):
+def test_estimate_v2_read_size_bytes_uses_sampled_ratio_not_flat_default(tmp_path):
     # Regression test for a live SF1000 TPC-H hang: a flat on-disk-to-
     # in-memory ratio (5x) overshoots badly for fixed-width-heavy schemas
     # (ints, floats, decimals, dates) -- exactly what TPC-H's ``lineitem``
     # looks like -- inflating the estimate enough that a downstream
     # hash-aggregate's per-aggregator memory request exceeded total cluster
-    # memory and hung. The estimate must use the sample's real,
-    # footer-derived in-memory sizes instead of guessing a flat ratio.
-    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+    # memory and hung. The estimate must use a real, sampled encoding ratio
+    # (measured by actually decoding a sampled file, the same way V1's
+    # ParquetDatasource does) instead of guessing a flat ratio.
     from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
         PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT,
     )
@@ -319,15 +307,46 @@ def test_estimate_v2_read_size_bytes_uses_footer_ratio_not_flat_default(tmp_path
     _write_parquet(str(tmp_path / "f0.parquet"), table)
 
     datasource = ParquetDatasourceV2([str(tmp_path)])
-    indexer = datasource._get_file_indexer()
-    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+    sample, scanner = _sample_and_scanner(datasource)
     assert len(sample) == 1
 
-    estimate = _estimate_v2_read_size_bytes(datasource, sample)
+    estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
     flat_ratio_estimate = int(
         int(sample.file_sizes.sum()) * PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
     )
     assert estimate < flat_ratio_estimate
+
+
+def test_estimate_v2_read_size_bytes_extrapolates_over_full_listing(tmp_path):
+    # The sampled ratio must be applied to the FULL listing's on-disk total,
+    # not just the (possibly much smaller) sampled subset -- otherwise a
+    # dataset with more files than the schema-inference sample cap would
+    # silently under-count.
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        SamplingInMemorySizeEstimator,
+    )
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    for i in range(5):
+        _write_parquet(
+            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(1000))})
+        )
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    sample, scanner = _sample_and_scanner(datasource)
+
+    estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
+
+    total_on_disk_bytes = sum(
+        os.path.getsize(str(tmp_path / f"f{i}.parquet")) for i in range(5)
+    )
+    sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+    sample_in_memory_bytes = float(
+        sample_estimator.estimate_in_memory_sizes(sample).sum()
+    )
+    ratio = sample_in_memory_bytes / float(sample.file_sizes.sum())
+    expected = int(total_on_disk_bytes * ratio)
+    assert estimate == expected
 
 
 def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
@@ -336,13 +355,11 @@ def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
     # Must never raise -- this is a best-effort signal, not a correctness
     # requirement, and a failure here must not break the read.
     from ray.data import read_api
-    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
 
     _write_parquet(str(tmp_path / "f0.parquet"), pa.table({"a": [1, 2, 3]}))
 
     datasource = ParquetDatasourceV2([str(tmp_path)])
-    indexer = datasource._get_file_indexer()
-    sample = sample_files(indexer, datasource.paths, datasource.filesystem, [])
+    sample, scanner = _sample_and_scanner(datasource)
 
     def _raise(*args, **kwargs):
         raise OSError("simulated listing failure")
@@ -353,7 +370,7 @@ def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
 
     monkeypatch.setattr(indexing_utils, "_get_file_infos", _raise)
 
-    estimate = read_api._estimate_v2_read_size_bytes(datasource, sample)
+    estimate = read_api._estimate_v2_read_size_bytes(datasource, sample, scanner)
     assert estimate is None
 
 
@@ -361,68 +378,6 @@ def _write_multi_row_group_parquet(path, num_rows: int, row_group_size: int):
     table = pa.table({"id": list(range(num_rows))})
     pq.write_table(table, path, row_group_size=row_group_size)
     return table
-
-
-def test_estimate_v2_read_size_bytes_uses_full_listing_when_sample_is_truncated(
-    tmp_path,
-):
-    """A single file with more row-group chunks than the schema-inference
-    sample's row cap must not be treated as "sample is exact": the sample
-    would only cover a prefix of the file's chunks, so summing its
-    (per-chunk) sizes silently under-counts the file's true on-disk size.
-    The estimate must fall back to the full (unpruned) listing's total.
-    """
-    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
-    from ray.data.read_api import (
-        _SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
-        _estimate_v2_read_size_bytes,
-    )
-
-    file_path = str(tmp_path / "many_row_groups.parquet")
-    num_row_groups = _SCHEMA_INFERENCE_SAMPLE_MAX_FILES + 4
-    _write_multi_row_group_parquet(file_path, num_rows=num_row_groups, row_group_size=1)
-
-    ctx = DataContext.get_current()
-    prior_target = ctx.parquet_chunker_target_chunk_size
-    # Force ~one chunk per row group so this single file produces more
-    # manifest rows (chunks) than the schema-inference sample's row cap.
-    ctx.parquet_chunker_target_chunk_size = 1
-    try:
-        datasource = ParquetDatasourceV2([str(tmp_path)])
-        indexer = datasource._get_file_indexer()
-        sample = sample_files(
-            indexer,
-            datasource.paths,
-            datasource.filesystem,
-            [],
-            max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
-        )
-        # Sample truncated by its own row cap -- not exact/complete.
-        assert len(sample) == _SCHEMA_INFERENCE_SAMPLE_MAX_FILES
-
-        estimate = _estimate_v2_read_size_bytes(
-            datasource,
-            sample,
-            sample_max_files=_SCHEMA_INFERENCE_SAMPLE_MAX_FILES,
-        )
-
-        # Extrapolation should apply the sample's own footer-derived ratio to
-        # the FULL file's on-disk size (not just the truncated sample's).
-        sample_in_memory_bytes = float(
-            datasource.get_size_estimator().estimate_in_memory_sizes(sample).sum()
-        )
-        sample_on_disk_bytes = float(sample.file_sizes.sum())
-        ratio = sample_in_memory_bytes / sample_on_disk_bytes
-        expected = int(os.path.getsize(file_path) * ratio)
-        assert estimate == expected
-
-        # The buggy file-count-vs-row-count comparison would have treated the
-        # truncated sample as exact and used its (smaller) in-memory sum
-        # directly instead of extrapolating over the full file.
-        truncated_only_estimate = int(sample_in_memory_bytes)
-        assert truncated_only_estimate < expected
-    finally:
-        ctx.parquet_chunker_target_chunk_size = prior_target
 
 
 def test_fragments_to_read_coalesces_sister_chunks(tmp_path):
