@@ -323,10 +323,15 @@ def test_estimate_v2_read_size_bytes_extrapolates_over_full_listing(tmp_path):
     # _estimate_v2_read_size_bytes itself uses for both the ratio and the
     # full-listing total) -- a Parquet row group's chunk-derived byte size
     # excludes file-level footer/overhead bytes, so `sample.file_sizes`
-    # doesn't exactly equal `os.path.getsize`.
+    # doesn't exactly equal `os.path.getsize`. Pass the same `filesystem` the
+    # real function does, so this uses the same footer-bounded, per-row-group
+    # ratio measurement (not the whole-file fallback, which uses a slightly
+    # different on-disk denominator and would make this comparison inexact).
     whole_file_sample = _manifest_of(paths)
     total_on_disk_bytes = int(whole_file_sample.file_sizes.sum())
-    sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+    sample_estimator = SamplingInMemorySizeEstimator(
+        scanner.create_reader(), filesystem=datasource.filesystem
+    )
     sample_in_memory_bytes = float(
         sample_estimator.estimate_in_memory_sizes(whole_file_sample).sum()
     )
@@ -394,6 +399,63 @@ def test_sampling_in_memory_size_estimator_averages_multiple_files(tmp_path):
     )
 
 
+def test_sampling_in_memory_size_estimator_bounds_to_first_row_group(tmp_path):
+    # Regression test for a review-confirmed accuracy bug: when a sampled
+    # file's read naturally needed more than one batch (true for any
+    # reasonably large file), the old implementation gave up computing a
+    # real ratio and assumed decoded size == on-disk size (1:1 encoding) --
+    # a large, systematic under-estimate, since Parquet data almost always
+    # expands once decoded. Confirmed live: this made a real table's size
+    # estimate come out ~3x too small. Bounding the sample read to the
+    # file's first row group (its real, footer-derived on-disk size,
+    # mirroring V1's own sampling) means a real ratio is always measured
+    # -- unconditionally, regardless of how many batches that row group
+    # itself decodes into (unlike the old code, which only computed a real
+    # ratio if the *whole file* happened to decode in a single batch).
+    import pyarrow.parquet as pq
+
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        SamplingInMemorySizeEstimator,
+    )
+
+    # Highly compressible data -- decoded size is much larger than on-disk
+    # size, so a ~1.0 ratio (what the old "give up" fallback would produce)
+    # is clearly distinguishable from the real one.
+    file_path = tmp_path / "big.parquet"
+    _write_parquet(str(file_path), pa.table({"a": [0] * 200_000}))
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    manifest = _manifest_of([str(file_path)])
+    scanner = datasource.create_scanner(datasource.infer_schema(manifest))
+
+    estimator = SamplingInMemorySizeEstimator(
+        scanner.create_reader(), filesystem=datasource.filesystem
+    )
+    sizes = estimator.estimate_in_memory_sizes(manifest)
+    ratio = float(sizes[0]) / float(manifest.file_sizes[0])
+
+    # Independently compute the expected ratio: decode row group 0 for real
+    # and divide by its own footer-reported *compressed* (on-disk) size --
+    # not the whole file's on-disk size, which is what a correct
+    # row-group-bounded estimate must use (this file has exactly one row
+    # group, so "row group 0" and "the whole file" are the same data here).
+    # ``RowGroupMetaData`` only exposes the *uncompressed* total_byte_size --
+    # the on-disk size lives on each column chunk, so sum those.
+    footer = pq.read_metadata(str(file_path))
+    row_group_0 = footer.row_group(0)
+    row_group_0_on_disk = sum(
+        row_group_0.column(i).total_compressed_size
+        for i in range(row_group_0.num_columns)
+    )
+    table = pq.read_table(str(file_path))
+    expected_ratio = table.nbytes / row_group_0_on_disk
+
+    assert ratio == pytest.approx(expected_ratio, rel=0.05)
+    # And this must be a real, large ratio -- not the ~1.0 the old "give up"
+    # fallback would have produced for a large, highly compressible file.
+    assert ratio > 5.0
+
+
 def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
     tmp_path, monkeypatch
 ):
@@ -455,8 +517,12 @@ def test_estimate_v2_read_size_bytes_normalizes_chunked_sample_to_whole_file(tmp
 
     # Independently compute the correct ratio from a single, whole-file row
     # (what a metadata-free whole-file chunker's sample would look like).
+    # Pass the same `filesystem` the real function does, so this uses the
+    # same footer-bounded ratio measurement, not the whole-file fallback.
     whole_file_sample = _manifest_of([str(file_path)])
-    sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+    sample_estimator = SamplingInMemorySizeEstimator(
+        scanner.create_reader(), filesystem=datasource.filesystem
+    )
     correct_in_memory_bytes = float(
         sample_estimator.estimate_in_memory_sizes(whole_file_sample).sum()
     )

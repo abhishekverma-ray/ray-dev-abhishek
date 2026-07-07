@@ -554,7 +554,9 @@ def _estimate_v2_read_size_bytes(
     )
 
     try:
-        sample_estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+        sample_estimator = SamplingInMemorySizeEstimator(
+            scanner.create_reader(), filesystem=datasource.filesystem
+        )
         sample_in_memory_bytes = float(
             sample_estimator.estimate_in_memory_sizes(normalized_sample).sum()
         )

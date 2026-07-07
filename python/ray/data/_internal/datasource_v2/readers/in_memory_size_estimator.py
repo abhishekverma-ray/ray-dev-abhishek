@@ -1,16 +1,23 @@
 import logging
 import math
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
+from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+    ParquetFileChunkMetadata,
+    create_chunk_metadata,
+)
 from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
 from ray.data._internal.datasource_v2.readers.file_reader import FileReader
 from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
 from ray.data.block import BlockAccessor
 from ray.util.annotations import DeveloperAPI
 from ray.util.debug import log_once
+
+if TYPE_CHECKING:
+    from pyarrow.fs import FileSystem
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +65,20 @@ class SamplingInMemorySizeEstimator(InMemorySizeEstimator):
     estimated an encoding ratio yet, it'll sample files to estimate it. Otherwise,
     it'll use the previously estimated encoding ratio.
 
-    TODO: This approach doesn't work well for formats that produce multiple batches
-    (because we assume a 1:1 encoding ratio) or for formats that vary in encoding
-    ratios (e.g. videos).
+    When ``filesystem`` is provided, each sampled file's ratio is measured from
+    just its first Parquet row group (bounded, footer-derived on-disk size),
+    mirroring V1's ``_fetch_parquet_file_info``: this always yields a real,
+    measured ratio, no matter how large the rest of the file is. Without a
+    ``filesystem`` (or if the footer can't be read), falls back to reading the
+    file via ``reader`` directly, which only produces a real ratio when the file
+    happens to decode in a single batch -- for a large file that needs more than
+    one, it assumes a 1:1 ratio rather than reading the whole thing (confirmed via
+    a live A/B: this silently under-estimated a real table's size by ~3x).
     """
 
-    def __init__(self, reader: "FileReader"):
+    def __init__(self, reader: "FileReader", filesystem: Optional["FileSystem"] = None):
         self._reader = reader
+        self._filesystem = filesystem
 
         self._encoding_ratio = None
 
@@ -140,6 +154,99 @@ class SamplingInMemorySizeEstimator(InMemorySizeEstimator):
         if not file_size:
             return None
 
+        row_group_on_disk_size = self._first_row_group_on_disk_size(path)
+        if row_group_on_disk_size:
+            ratio = self._estimate_ratio_from_row_group(
+                path, file_size, row_group_on_disk_size
+            )
+            if ratio is not None:
+                return ratio
+        return self._estimate_ratio_from_whole_file(path, file_size)
+
+    def _first_row_group_on_disk_size(self, path: str) -> Optional[int]:
+        """Return the first row group's on-disk (compressed) byte size from the
+        Parquet footer, or ``None`` if it can't be determined (no filesystem
+        configured, the footer can't be read, or the file has no row groups).
+
+        ``RowGroupMetaData`` exposes only the *uncompressed* ``total_byte_size``
+        -- the on-disk size lives on each ``ColumnChunkMetaData``, so sum the
+        per-column compressed sizes (mirrors ``ParquetFileChunker``'s footer
+        loop, which needs this same on-disk figure for the same reason).
+        """
+        if self._filesystem is None:
+            return None
+        try:
+            import pyarrow.parquet as pq
+
+            metadata = pq.read_metadata(path, filesystem=self._filesystem)
+            if metadata.num_row_groups == 0:
+                return None
+            row_group = metadata.row_group(0)
+            compressed_size = sum(
+                row_group.column(i).total_compressed_size
+                for i in range(row_group.num_columns)
+            )
+            return compressed_size or None
+        except Exception as e:
+            logger.debug(
+                "Failed to read footer for '%s' to bound the encoding-ratio "
+                "sample read: %s",
+                path,
+                e,
+            )
+            return None
+
+    def _estimate_ratio_from_row_group(
+        self,
+        path: str,
+        file_size: int,
+        row_group_on_disk_size: int,
+    ) -> Optional[float]:
+        """Estimate the encoding ratio from just the file's first row group.
+
+        Bounding the read to one row group (rather than the whole file) means
+        this always yields a real, measured ratio, no matter how large the rest
+        of the file is or how many batches the row group itself decodes into --
+        unlike ``_estimate_ratio_from_whole_file``, which gives up and assumes a
+        1:1 ratio the moment a file needs more than one batch.
+        """
+        chunk_metadata = create_chunk_metadata(
+            ParquetFileChunkMetadata,
+            row_group_start=0,
+            row_group_end=1,
+            # Not used by the read path itself (only row_group_start/end are);
+            # these are placeholders for the manifest's benefit.
+            in_memory_size=0,
+            num_rows=0,
+            row_offset=0,
+        )
+        manifest = FileManifest.construct_manifest(
+            [path],
+            [file_size],
+            [chunk_metadata],
+        )
+        builder = DelegatingBlockBuilder()
+        has_data = False
+        for batch in self._reader.read(manifest):
+            builder.add_batch(batch)
+            has_data = True
+        if not has_data:
+            return None
+        in_memory_size = BlockAccessor.for_block(builder.build()).size_bytes()
+        if not in_memory_size:
+            return None
+        return in_memory_size / row_group_on_disk_size
+
+    def _estimate_ratio_from_whole_file(
+        self,
+        path: str,
+        file_size: int,
+    ) -> Optional[float]:
+        """Fallback used when the footer can't be read (e.g. no ``filesystem``
+        configured): read the whole file via ``reader`` directly. Only yields a
+        real ratio if the file decodes in a single batch; otherwise assumes a
+        1:1 ratio rather than reading the whole (potentially large) file.
+        """
         # Use ``None`` chunk metadata: the size estimator reads the file whole
         # to estimate the encoding ratio; chunk-level splitting is irrelevant here.
         manifest = FileManifest.construct_manifest(
