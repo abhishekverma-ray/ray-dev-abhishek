@@ -483,20 +483,6 @@ def _estimate_v2_read_size_bytes(
     chunker-independent -- it's a raw filesystem list, not a chunked read),
     makes this function correct regardless of which chunker sampling uses.
 
-    Derives a real, per-dataset encoding ratio the same way V1's
-    ``ParquetDatasource`` does (``_estimate_files_encoding_ratio``): actually
-    read and decode one of the schema-inference sample's files via
-    ``SamplingInMemorySizeEstimator``, measure its real Arrow in-memory size
-    against its on-disk size, and apply that ratio to the full listing's
-    on-disk total. A flat ratio constant (e.g. the old 5x default) can
-    overshoot badly for schemas dominated by fixed-width columns (ints,
-    decimals, dates) -- exactly what ``lineitem``-shaped TPC-H tables look
-    like (confirmed: a live A/B at SF1000 showed a flat 5x ratio inflating
-    the estimate to ~1.68x the real, footer-derived size V1 measures for the
-    same data, which combined with a too-small ``num_partitions`` to make a
-    hash-aggregate's per-aggregator memory request exceed total cluster
-    memory and hang).
-
     Lists every file's on-disk size directly (not just the schema-inference
     sample) -- this is a full, but NOT pruning-aware (partition_filter /
     file_extensions aren't applied), directory listing; it may slightly
@@ -531,6 +517,14 @@ def _estimate_v2_read_size_bytes(
         return None
 
     if total_files == 0:
+        return None
+
+    if total_on_disk_bytes == 0:
+        # Files exist but none reported a size (e.g. some filesystems, like
+        # certain HTTP backends, don't expose it). There's no on-disk signal
+        # to scale a ratio against, and multiplying a real ratio by 0 below
+        # would return 0 -- making a real, non-empty read look empty to
+        # ``ReadFiles.estimated_num_outputs()``. ``None`` (unknown) is correct.
         return None
 
     # Normalize the sample to one row per distinct path with the real
