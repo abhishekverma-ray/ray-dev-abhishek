@@ -172,9 +172,21 @@ DEFAULT_PARQUET_VALIDATE_CHUNK_RANGES_AT_READ_TIME = env_bool(
 # Kill switch: cap ReadFiles.estimated_num_outputs()'s byte-size-driven estimate
 # against a CPU-aware ceiling (max(read_op_min_num_blocks, 2 * avail_cpus), the same
 # floor/CPU terms _autodetect_parallelism() uses for V1's own read parallelism).
-# Rollback switch in case the cap itself is ever wrong for some workload.
+#
+# Defaults to False (disabled): avail_cpus is read from ray.cluster_resources() at
+# plan time, which on an autoscaling cluster reflects only whatever's currently
+# registered -- the autoscaler hasn't yet reacted to this read's own demand, so
+# avail_cpus is systematically undercounted right when the estimate is computed.
+# When 2*avail_cpus falls below the read_op_min_num_blocks floor (default 200),
+# the ceiling collapses to that fixed floor regardless of dataset size. For a
+# large-enough dataset (confirmed live: tpch_q1_autoscaling at SF1000) that pins
+# num_partitions to ~200 no matter how big the data is, which -- via the same
+# dataset_bytes/num_partitions "output" memory mechanism as the hash-shuffle
+# aggregator cap above -- can push a hash-aggregate's per-actor memory request
+# past the cluster's capacity and hang the pool. Rollback switch in case a
+# future, autoscale-aware version of this cap is ever wrong for some workload.
 DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED = env_bool(
-    "RAY_DATA_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED", True
+    "RAY_DATA_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED", False
 )
 
 # Kill switch: cap a hash-shuffle op's auto-derived (no explicit num_partitions
@@ -670,13 +682,20 @@ class DataContext:
             time. Defaults to False (footer read once, at listing time). Set
             to True to restore the pre-optimization double-footer-read
             behavior, e.g. if files can change between listing and reading.
-        read_files_estimated_num_outputs_cap_enabled: When True (the default),
+        read_files_estimated_num_outputs_cap_enabled: When True,
             ``ReadFiles.estimated_num_outputs()``'s byte-size-driven estimate is
             capped against ``max(read_op_min_num_blocks, 2 * avail_cpus)`` -- the
             same floor/CPU terms V1's ``_autodetect_parallelism()`` uses -- so a
             hash-shuffle stage sized from this estimate never proposes more
-            partitions than the cluster's CPU count would justify. Set to False
-            to restore the uncapped byte-size-only estimate.
+            partitions than the cluster's CPU count would justify. Defaults to
+            False: ``avail_cpus`` is read from live cluster resources at plan
+            time, which on an autoscaling cluster undercounts its eventual size
+            (the autoscaler hasn't reacted to this read's demand yet), collapsing
+            the ceiling to the ``read_op_min_num_blocks`` floor regardless of
+            dataset size -- for a large enough dataset this can push a
+            hash-aggregate's per-actor memory request past the cluster's
+            capacity and hang, the same failure mode as the hash-shuffle
+            aggregator cap above.
         enable_tensor_extension_casting: Whether to automatically cast NumPy ndarray
             columns in Pandas DataFrames to tensor extension columns.
         arrow_fixed_shape_tensor_format: The tensor format to use for fixed-shape tensors.

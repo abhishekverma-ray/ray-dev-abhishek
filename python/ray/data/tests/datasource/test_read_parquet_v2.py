@@ -214,6 +214,10 @@ def test_read_parquet_v2_estimated_num_outputs_cpu_cap(
     target_max_block_size = DataContext.get_current().target_max_block_size
     assert target_max_block_size is not None
     restore_ctx.read_op_min_num_blocks = 200
+    # This test exercises the cap mechanism itself (default is now off --
+    # see DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED), so enable it
+    # explicitly rather than relying on the default.
+    restore_ctx.read_files_estimated_num_outputs_cap_enabled = True
 
     huge = dataclasses.replace(
         read_files, size_bytes_estimate=10_000 * target_max_block_size
