@@ -346,6 +346,67 @@ class TestFileChunkerIntegration:
         ]
 
 
+def _unresolvable_paths_and_filesystem(bad_path):
+    """Mimics ``_resolve_paths_and_filesystem``'s own failure mode: for a
+    path it can't resolve, it logs a warning and returns an EMPTY list
+    (never raises) -- see ``path_util.py``."""
+    import ray.data._internal.datasource_v2.listing.file_indexer as indexer_mod
+
+    original = indexer_mod._resolve_paths_and_filesystem
+
+    def _patched(path, filesystem):
+        if path == bad_path:
+            return [], filesystem
+        return original(path, filesystem)
+
+    return _patched
+
+
+def test_list_files_skips_unresolvable_path_when_ignoring(
+    tmp_path, indexer, monkeypatch
+):
+    # Regression test for a cursor[bot] finding (same pattern as
+    # plan_list_files_op._expand_paths_to_files): _resolve_paths_and_filesystem
+    # can return an empty list for a path it couldn't resolve. With
+    # ignore_missing_paths=True this must be skipped, not trip the "exactly
+    # one resolved path" assert. Covers both the sequential and threaded
+    # iterators via the parametrized ``indexer`` fixture.
+    import ray.data._internal.datasource_v2.listing.file_indexer as indexer_mod
+
+    f = tmp_path / "data.csv"
+    f.write_text("hello")
+    bad_path = "s3://this-path-does-not-resolve/whatever"
+
+    monkeypatch.setattr(
+        indexer_mod,
+        "_resolve_paths_and_filesystem",
+        _unresolvable_paths_and_filesystem(bad_path),
+    )
+
+    ignoring_indexer = NonSamplingFileIndexer(
+        ignore_missing_paths=True, num_workers=indexer._num_workers
+    )
+    results = _list_all(ignoring_indexer, [bad_path, str(f)])
+    assert results == [(str(f), 5)]
+
+
+def test_list_files_raises_clear_error_on_unresolvable_path(indexer, monkeypatch):
+    # Same as above, but ignore_missing_paths=False must raise a clear
+    # ValueError -- not the bare AssertionError from tripping
+    # "assert len(resolved_paths) == 1" on the empty list.
+    import ray.data._internal.datasource_v2.listing.file_indexer as indexer_mod
+
+    bad_path = "s3://this-path-does-not-resolve/whatever"
+    monkeypatch.setattr(
+        indexer_mod,
+        "_resolve_paths_and_filesystem",
+        _unresolvable_paths_and_filesystem(bad_path),
+    )
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        _list_all(indexer, [bad_path])
+
+
 if __name__ == "__main__":
     import sys
 

@@ -125,6 +125,73 @@ def test_expand_paths_to_files_lists_and_sorts(tmp_path):
     assert all(p.endswith(".parquet") for p in files)
 
 
+def _unresolvable_paths_and_filesystem(bad_path):
+    """Mimics ``_resolve_paths_and_filesystem``'s own failure mode: for a
+    path it can't resolve, it logs a warning and returns an EMPTY list
+    (never raises) -- see ``path_util.py``."""
+    import ray.data._internal.planner.plan_list_files_op as plan_mod
+
+    original = plan_mod._resolve_paths_and_filesystem
+
+    def _patched(path, filesystem):
+        if path == bad_path:
+            return [], filesystem
+        return original(path, filesystem)
+
+    return _patched
+
+
+def test_expand_paths_to_files_skips_unresolvable_path_when_ignoring(
+    tmp_path, monkeypatch
+):
+    # Regression test for a cursor[bot] finding: _resolve_paths_and_filesystem
+    # can return an empty list for a path it couldn't resolve (it logs and
+    # skips rather than raising) -- with ignore_missing_paths=True this must
+    # be skipped, not trip the "exactly one resolved path" assert.
+    import pyarrow.fs as pafs
+
+    import ray.data._internal.planner.plan_list_files_op as plan_mod
+
+    for i in range(3):
+        pq.write_table(pa.table({"x": [i]}), str(tmp_path / f"f{i}.parquet"))
+    good_path = str(tmp_path)
+    bad_path = "s3://this-path-does-not-resolve/whatever"
+
+    monkeypatch.setattr(
+        plan_mod,
+        "_resolve_paths_and_filesystem",
+        _unresolvable_paths_and_filesystem(bad_path),
+    )
+
+    files = plan_mod._expand_paths_to_files(
+        [bad_path, good_path], pafs.LocalFileSystem(), True, num_workers=1
+    )
+    assert len(files) == 3
+
+
+def test_expand_paths_to_files_raises_clear_error_on_unresolvable_path(
+    tmp_path, monkeypatch
+):
+    # Same as above, but ignore_missing_paths=False must raise a clear
+    # ValueError -- not the bare AssertionError from tripping
+    # "assert len(resolved_paths) == 1" on the empty list.
+    import pyarrow.fs as pafs
+
+    import ray.data._internal.planner.plan_list_files_op as plan_mod
+
+    bad_path = "s3://this-path-does-not-resolve/whatever"
+    monkeypatch.setattr(
+        plan_mod,
+        "_resolve_paths_and_filesystem",
+        _unresolvable_paths_and_filesystem(bad_path),
+    )
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        plan_mod._expand_paths_to_files(
+            [bad_path], pafs.LocalFileSystem(), False, num_workers=1
+        )
+
+
 @pytest.mark.parametrize("num_files", [1, 2, 50, 250])
 def test_single_prefix_fans_out_across_tasks(
     ray_start_2_cpus_shared, tmp_path, num_files

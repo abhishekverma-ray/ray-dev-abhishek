@@ -264,6 +264,45 @@ def test_sample_files_counts_distinct_paths_not_chunk_rows(tmp_path):
     assert len(set(sample.paths)) == 2
 
 
+def test_infer_schema_reads_footer_once_per_distinct_file(tmp_path, monkeypatch):
+    """Regression test for a cursor[bot] finding: a manifest can carry many
+    rows for the same file (one per row-group chunk). ``infer_schema`` must
+    read that file's footer exactly once, not once per chunk row -- an
+    O(row-group count) blowup in redundant remote schema reads otherwise."""
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+
+    big_path = tmp_path / "big.parquet"
+    pq.write_table(pa.table({"a": list(range(100))}), str(big_path), row_group_size=10)
+
+    # Force one row group per chunk, so "big.parquet" alone yields 10 manifest
+    # rows all sharing the same path.
+    chunker = ParquetFileChunker(target_chunk_size=1)
+    datasource = ParquetDatasourceV2([str(tmp_path)], file_chunker=chunker)
+
+    sample = sample_files(
+        datasource._get_file_indexer(),
+        datasource.paths,
+        datasource.filesystem,
+        [],
+        max_files=1,
+    )
+    assert len(sample) == 10
+    assert len(set(sample.paths)) == 1
+
+    read_schema_calls = []
+    original_read_schema = pq.read_schema
+
+    def _counting_read_schema(*args, **kwargs):
+        read_schema_calls.append(args)
+        return original_read_schema(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_schema", _counting_read_schema)
+
+    datasource.infer_schema(sample)
+
+    assert len(read_schema_calls) == 1
+
+
 def _sample_and_scanner(datasource):
     """Mirror ``_read_datasource_v2``'s own sample+scanner construction."""
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files

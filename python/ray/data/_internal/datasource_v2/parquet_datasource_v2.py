@@ -218,7 +218,14 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         if len(sample) == 0:
             return self._user_schema if self._user_schema is not None else pa.schema([])
 
-        sample_paths: List[str] = sample.paths.tolist()
+        # De-dupe to one entry per distinct path: ``sample`` is a manifest,
+        # so a row-group-aware chunker can emit multiple rows for the same
+        # file (one per chunk) -- reading the footer once per chunk instead
+        # of once per file would redundantly re-read the same file's footer
+        # up to its row-group count times. ``dict.fromkeys`` preserves
+        # first-occurrence order, which matters for both the schema-unify
+        # order below and ``sample_paths[0]`` driving partition discovery.
+        sample_paths: List[str] = list(dict.fromkeys(sample.paths.tolist()))
         # Parquet footer reads against high-latency object stores
         # (S3, GCS) are ~50-100 ms each. Reading the sample's footers in
         # parallel keeps driver-side schema inference bounded by the

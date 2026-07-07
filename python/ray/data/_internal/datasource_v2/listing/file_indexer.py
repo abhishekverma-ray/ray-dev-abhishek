@@ -146,6 +146,19 @@ class NonSamplingFileIndexer(FileIndexer):
     ) -> Iterable[FileInfo]:
         for input_path in paths.to_pylist():
             resolved_paths, _ = _resolve_paths_and_filesystem(input_path, filesystem)
+            if not resolved_paths:
+                # ``_resolve_paths_and_filesystem`` logs a warning and drops a
+                # path it couldn't resolve rather than raising -- respect
+                # ``ignore_missing_paths`` here too instead of tripping the
+                # assert below on an empty list.
+                if self._ignore_missing_paths:
+                    continue
+                raise ValueError(
+                    f"Failed to resolve path {input_path!r} (see the warning "
+                    "logged above for the underlying error). Pass "
+                    "ignore_missing_paths=True to skip unresolvable paths "
+                    "instead of raising."
+                )
             assert len(resolved_paths) == 1
 
             for path, file_size in _get_file_infos(
@@ -172,6 +185,19 @@ class NonSamplingFileIndexer(FileIndexer):
                 resolved_paths, _ = _resolve_paths_and_filesystem(
                     input_path, filesystem
                 )
+                if not resolved_paths:
+                    # ``_resolve_paths_and_filesystem`` logs a warning and drops
+                    # a path it couldn't resolve rather than raising -- respect
+                    # ``ignore_missing_paths`` here too instead of tripping the
+                    # assert below on an empty list.
+                    if self._ignore_missing_paths:
+                        continue
+                    raise ValueError(
+                        f"Failed to resolve path {input_path!r} (see the "
+                        "warning logged above for the underlying error). Pass "
+                        "ignore_missing_paths=True to skip unresolvable paths "
+                        "instead of raising."
+                    )
                 assert len(resolved_paths) == 1
 
                 for path, file_size in _get_file_infos(
