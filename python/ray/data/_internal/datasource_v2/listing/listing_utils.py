@@ -120,19 +120,22 @@ def sample_files(
     pruners: Optional[List[FilePruner]] = None,
     max_files: int = 16,
 ) -> FileManifest:
-    """Drive the indexer until up to ``max_files`` files arrive; return them.
+    """Drive the indexer until up to ``max_files`` distinct files arrive; return them.
 
     Used for driver-side schema inference in ``_read_datasource_v2``.
     Sampling more than one file lets callers unify schemas (e.g., if the
     first file has an all-null column, later files' non-null types can
-    promote it). No caching — the returned manifest is discarded after
-    schema inference, and the ``ListFiles`` op lists the same paths
+    promote it). Counts *distinct file paths*, not manifest rows -- a
+    row-group-aware chunker can emit many rows for a single file, and
+    counting rows would let one large file consume the whole sample before
+    any other file is seen. No caching — the returned manifest is discarded
+    after schema inference, and the ``ListFiles`` op lists the same paths
     again on workers at execution time.
     """
     assert max_files >= 1
     paths_column = pa.array(paths, type=pa.string())
     collected: List[FileManifest] = []
-    collected_rows = 0
+    distinct_paths_seen = set()
     for manifest in indexer.list_files(
         paths_column,
         filesystem=filesystem,
@@ -141,18 +144,27 @@ def sample_files(
     ):
         if len(manifest) == 0:
             continue
-        remaining = max_files - collected_rows
-        if len(manifest) <= remaining:
-            collected.append(manifest)
-            collected_rows += len(manifest)
-        else:
-            collected.append(
-                FileManifest(
-                    BlockAccessor.for_block(manifest.as_block()).slice(0, remaining)
+        manifest_paths = manifest.paths
+        # Row index at which the (max_files+1)-th distinct path would start,
+        # if any -- everything before that stays in the sample.
+        cutoff = len(manifest_paths)
+        for i, path in enumerate(manifest_paths):
+            if path in distinct_paths_seen:
+                continue
+            if len(distinct_paths_seen) >= max_files:
+                cutoff = i
+                break
+            distinct_paths_seen.add(path)
+        if cutoff > 0:
+            if cutoff < len(manifest_paths):
+                collected.append(
+                    FileManifest(
+                        BlockAccessor.for_block(manifest.as_block()).slice(0, cutoff)
+                    )
                 )
-            )
-            collected_rows = max_files
-        if collected_rows >= max_files:
+            else:
+                collected.append(manifest)
+        if len(distinct_paths_seen) >= max_files:
             break
     if not collected:
         return FileManifest.construct_manifest(paths=[], sizes=[], chunk_metadatas=[])

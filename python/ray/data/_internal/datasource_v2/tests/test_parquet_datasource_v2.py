@@ -235,6 +235,35 @@ def test_datasource_accepts_custom_chunker(tmp_path):
     assert indexer.file_chunker is custom
 
 
+def test_sample_files_counts_distinct_paths_not_chunk_rows(tmp_path):
+    """A single large multi-row-group file must not consume the whole
+    schema-inference sample on its own -- ``sample_files`` counts distinct
+    files against ``max_files``, not manifest rows (a row-group-aware
+    chunker emits one row per row group, so a big first file could
+    otherwise exhaust the sample before any other file is seen)."""
+    from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
+
+    big_path = tmp_path / "big.parquet"
+    pq.write_table(pa.table({"a": list(range(100))}), str(big_path), row_group_size=10)
+
+    for i in range(3):
+        _write_parquet(str(tmp_path / f"small{i}.parquet"), pa.table({"a": [i]}))
+
+    # Force one row group per chunk, so "big.parquet" alone yields 10 manifest rows.
+    chunker = ParquetFileChunker(target_chunk_size=1)
+    datasource = ParquetDatasourceV2([str(tmp_path)], file_chunker=chunker)
+
+    sample = sample_files(
+        datasource._get_file_indexer(),
+        datasource.paths,
+        datasource.filesystem,
+        [],
+        max_files=2,
+    )
+
+    assert len(set(sample.paths)) == 2
+
+
 def _sample_and_scanner(datasource):
     """Mirror ``_read_datasource_v2``'s own sample+scanner construction."""
     from ray.data._internal.datasource_v2.listing.listing_utils import sample_files
@@ -263,6 +292,38 @@ def test_estimate_v2_read_size_bytes_returns_positive_estimate(tmp_path):
     estimate = _estimate_v2_read_size_bytes(datasource, sample, scanner)
     assert estimate is not None
     assert estimate > 0
+
+
+def test_estimate_v2_read_size_bytes_returns_none_when_all_sizes_missing(
+    tmp_path, monkeypatch
+):
+    # Some filesystems (e.g. certain HTTP backends) don't report a file
+    # size -- `_get_file_infos` can then yield `file_size=None` for every
+    # file. The estimate must return `None` (unknown), not `0`: a `0`
+    # estimate makes a real, non-empty read look empty to
+    # `ReadFiles.estimated_num_outputs()`.
+    from ray.data._internal.datasource_v2.listing import indexing_utils
+    from ray.data.read_api import _estimate_v2_read_size_bytes
+
+    for i in range(3):
+        _write_parquet(
+            str(tmp_path / f"f{i}.parquet"), pa.table({"a": list(range(100))})
+        )
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+    sample, scanner = _sample_and_scanner(datasource)
+
+    original_get_file_infos = indexing_utils._get_file_infos
+
+    def _no_size_get_file_infos(path, filesystem, ignore_missing_path):
+        for file_path, _size in original_get_file_infos(
+            path, filesystem, ignore_missing_path
+        ):
+            yield file_path, None
+
+    monkeypatch.setattr(indexing_utils, "_get_file_infos", _no_size_get_file_infos)
+
+    assert _estimate_v2_read_size_bytes(datasource, sample, scanner) is None
 
 
 def test_estimate_v2_read_size_bytes_uses_sampled_ratio_not_flat_default(tmp_path):
