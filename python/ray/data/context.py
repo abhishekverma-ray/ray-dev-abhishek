@@ -185,10 +185,22 @@ DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED = env_bool(
 # (confirmed: two live TPC-H A/Bs at SF100 measured a ~41-42% Shuffle+Aggregation
 # throughput drop at a 653:128 partitions:aggregators ratio vs. V1's 100:100).
 # DSv2-only regardless of this switch -- see use_datasource_v2 in
-# HashShufflingOperatorBase. Rollback switch in case the cap itself is ever
-# wrong for some workload.
+# HashShufflingOperatorBase.
+#
+# Defaults to False (disabled): capping partitions to the aggregator count
+# only holds `shuffle` memory (dataset_bytes/num_aggregators) fixed -- `output`
+# memory (dataset_bytes/num_partitions) rises to match it, since num_partitions
+# now equals num_aggregators too. For a large-enough dataset that's fatal, not
+# just slower: confirmed live on tpch_q1 at SF1000 (~815GiB) -- pre-cap, 128
+# aggregators x ~7.2GiB each ~= 917GiB (fits a 1.2TiB cluster, matching the
+# real pre-cap log); post-cap, 128 x ~12.7GiB ~= 1.63TiB, which EXCEEDS the
+# cluster's total memory, so Ray can never schedule enough aggregators
+# simultaneously and the pool hangs forever waiting on resources that will
+# never free up. The mechanism is kept (and still tested) for a future,
+# memory-aware version of this cap -- just not enabled by default until one
+# exists that accounts for per-actor memory, not just partition count.
 DEFAULT_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS = env_bool(
-    "RAY_DATA_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS", True
+    "RAY_DATA_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS", False
 )
 
 DEFAULT_ACTOR_PREFETCHER_ENABLED = False
@@ -762,16 +774,21 @@ class DataContext:
             :class:`IcebergConfig` for details.
         default_hash_shuffle_parallelism: Default parallelism level for hash-based
             shuffle operations if the number of partitions is unspecifed.
-        hash_shuffle_cap_target_partitions_to_aggregators: When True (the
-            default), a hash-shuffle op's auto-derived (no explicit
-            ``num_partitions``) target partition count is capped to the
-            aggregator pool size it will actually run with, whenever the read
-            feeding it is DataSourceV2 (see ``use_datasource_v2`` -- V1's own
+        hash_shuffle_cap_target_partitions_to_aggregators: When True, a
+            hash-shuffle op's auto-derived (no explicit ``num_partitions``)
+            target partition count is capped to the aggregator pool size it
+            will actually run with, whenever the read feeding it is
+            DataSourceV2 (see ``use_datasource_v2`` -- V1's own
             read-task-count-driven estimates are never affected by this
             switch). Without the cap, a byte-size-driven estimate can exceed
             the aggregator count, round-robin-fragmenting each actor's share
-            into many small hand-offs for the same total bytes. Set to False
-            to restore the uncapped estimate.
+            into many small hand-offs for the same total bytes. Defaults to
+            False: capping partitions to the aggregator count leaves
+            ``shuffle`` memory fixed but raises ``output`` memory to match it
+            (both become ``dataset_bytes / num_aggregators``), which can push
+            *total* aggregator memory past the cluster's capacity for a
+            large-enough dataset and hang the whole pool rather than just
+            running slower -- confirmed live on a ~815GiB SF1000 TPC-H query.
         hash_shuffle_compression: Codec used to compress hash-shuffle
             intermediate shards: "none", "lz4", or "zstd" (default "zstd").
         hash_shuffle_reduce_batch_size: Number of shard object references each
