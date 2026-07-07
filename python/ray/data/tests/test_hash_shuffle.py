@@ -75,6 +75,9 @@ class JoinTestCase:
     "tc",
     [
         # Case 1: Auto-derived partitions with limited CPUs
+        # max(10, 5) = 10 exceeds the 4-aggregator pool this cluster gets, so
+        # the DSv2 cap (hash_shuffle_cap_target_partitions_to_aggregators)
+        # clamps it down to 4 -- one partition per aggregator.
         JoinTestCase(
             left_size_bytes=1 * GiB,
             right_size_bytes=2 * GiB,
@@ -82,12 +85,12 @@ class JoinTestCase:
             right_num_blocks=5,
             target_num_partitions=None,  # Auto-derive
             total_cpu=4.0,
-            expected_num_partitions=10,  # max(10, 5)
-            expected_num_aggregators=4,  # min(10 partitions, 4 CPUs) = 4
+            expected_num_partitions=4,  # min(max(10, 5), max_shuffle_aggregators=4)
+            expected_num_aggregators=4,  # min(4 partitions, 4 CPUs) = 4
             expected_ray_remote_args={
-                "max_concurrency": 3,  # ceil(10 partitions / 4 aggregators)
+                "max_concurrency": 1,  # ceil(4 partitions / 4 aggregators)
                 "num_cpus": 0.25,  # 4 CPUs * 25% / 4 aggregators
-                "memory": 1771674012,
+                "memory": 3221225472,
                 "scheduling_strategy": "SPREAD",
                 "allow_out_of_order_execution": True,
             },
@@ -165,6 +168,8 @@ class JoinTestCase:
             },
         ),
         # Case 6: Testing num_cpus derived from memory allocation
+        # max(200, 200) = 200 exceeds the 128-aggregator cap (default max), so
+        # the DSv2 cap clamps it down to 128 -- one partition per aggregator.
         JoinTestCase(
             left_size_bytes=50 * GiB,
             right_size_bytes=50 * GiB,
@@ -172,12 +177,12 @@ class JoinTestCase:
             right_num_blocks=200,
             target_num_partitions=None,
             total_cpu=1024,  # Many CPUs
-            expected_num_partitions=200,
-            expected_num_aggregators=128,  # min(200, min(1000, 128 (default max))
+            expected_num_partitions=128,  # min(max(200, 200), max_shuffle_aggregators=128)
+            expected_num_aggregators=128,  # min(128 partitions, min(1024, 128 (default max))
             expected_ray_remote_args={
-                "max_concurrency": 2,  # ceil(200 / 128)
-                "num_cpus": 0.57,  # ~2.5Gb / 4Gb = ~0.57
-                "memory": 2449473536,
+                "max_concurrency": 1,  # ceil(128 / 128)
+                "num_cpus": 0.78,
+                "memory": 3355443200,
                 "scheduling_strategy": "SPREAD",
                 "allow_out_of_order_execution": True,
             },
@@ -296,18 +301,19 @@ class HashOperatorTestCase:
     "tc",
     [
         # Case 1: Auto-derived partitions with limited CPUs
+        # 16 blocks exceeds the 4-aggregator pool this cluster gets, so the
+        # DSv2 cap (hash_shuffle_cap_target_partitions_to_aggregators) clamps
+        # it down to 4 -- one partition per aggregator.
         HashOperatorTestCase(
             input_size_bytes=2 * GiB,
             input_num_blocks=16,
             target_num_partitions=None,
             total_cpu=4.0,
-            expected_num_partitions=16,
+            expected_num_partitions=4,  # min(16, max_shuffle_aggregators=4)
             expected_num_aggregators=4,
             expected_ray_remote_args={
-                "max_concurrency": 4,
-                # estimate-derived 640MiB is floored up to the modest default:
-                #   min(32GiB / 4 / 2, DEFAULT_ALLOCATION=1GiB) = 1GiB
-                "num_cpus": 0.25,  # min(min(4, 4*0.25/4), 1GiB / 4GiB) = 0.25
+                "max_concurrency": 1,  # ceil(4 / 4)
+                "num_cpus": 0.25,
                 "memory": 1073741824,
                 "scheduling_strategy": "SPREAD",
                 "allow_out_of_order_execution": True,
@@ -346,17 +352,19 @@ class HashOperatorTestCase:
             },
         ),
         # Case 4: Testing num_cpus derived from memory allocation
+        # 200 blocks exceeds the 128-aggregator cap (default max), so the
+        # DSv2 cap clamps it down to 128 -- one partition per aggregator.
         HashOperatorTestCase(
             input_size_bytes=50 * GiB,
             input_num_blocks=200,
             target_num_partitions=None,
             total_cpu=1024,  # Many CPUs
-            expected_num_partitions=200,
-            expected_num_aggregators=128,  # min(200, min(1000, 128 (default max))
+            expected_num_partitions=128,  # min(200, max_shuffle_aggregators=128)
+            expected_num_aggregators=128,  # min(128, min(1024, 128 (default max))
             expected_ray_remote_args={
-                "max_concurrency": 2,  # ceil(200 / 128)
-                "num_cpus": 0.16,  # ~0.6Gb / 4Gb = ~0.16
-                "memory": 687865856,
+                "max_concurrency": 1,  # ceil(128 / 128)
+                "num_cpus": 0.2,
+                "memory": 838860800,
                 "scheduling_strategy": "SPREAD",
                 "allow_out_of_order_execution": True,
             },
@@ -438,10 +446,12 @@ def test_hash_aggregate_operator_remote_args(
     "tc",
     [
         # Case 1: Auto-derived partitions with limited CPUs
+        # 16 blocks exceeds the 4-aggregator pool this cluster gets, so the
+        # DSv2 cap clamps it down to 4 -- one partition per aggregator.
         # Memory calculation:
-        #   max_partitions_per_agg = ceil(16 / 4) = 4
-        #   partition_size = ceil(2 GiB / 16) = 128 MiB
-        #   shuffle + output = 2 * (128 MiB * 4) = 1024 MiB
+        #   max_partitions_per_agg = ceil(4 / 4) = 1
+        #   partition_size = ceil(2 GiB / 4) = 512 MiB
+        #   shuffle + output = 2 * (512 MiB * 1) = 1024 MiB
         #   with 1.3x skew factor: ceil(1024 MiB * 1.3) = 1395864372
         # CPU calculation:
         #   cap = min(4.0, 4.0 * 0.25 / 4) = 0.25
@@ -451,10 +461,10 @@ def test_hash_aggregate_operator_remote_args(
             input_num_blocks=16,
             target_num_partitions=None,
             total_cpu=4.0,
-            expected_num_partitions=16,
+            expected_num_partitions=4,  # min(16, max_shuffle_aggregators=4)
             expected_num_aggregators=4,
             expected_ray_remote_args={
-                "max_concurrency": 4,
+                "max_concurrency": 1,  # ceil(4 / 4)
                 "num_cpus": 0.25,
                 "memory": 1395864372,
                 "scheduling_strategy": "SPREAD",
@@ -510,25 +520,27 @@ def test_hash_aggregate_operator_remote_args(
             },
         ),
         # Case 4: Testing num_cpus derived from memory allocation
+        # 200 blocks exceeds the 128-aggregator cap (default max), so the
+        # DSv2 cap clamps it down to 128 -- one partition per aggregator.
         # Memory calculation:
-        #   max_partitions_per_agg = ceil(200 / 128) = 2
-        #   partition_size = ceil(50 GiB / 200) = 256 MiB
-        #   shuffle + output = 2 * (256 MiB * 2) = 1024 MiB
-        #   with 1.3x skew factor: ceil(1024 MiB * 1.3) = 1395864372
+        #   max_partitions_per_agg = ceil(128 / 128) = 1
+        #   partition_size = ceil(50 GiB / 128) = 400 MiB
+        #   shuffle + output = 2 * (400 MiB * 1) = 800 MiB
+        #   with 1.3x skew factor: ceil(800 MiB * 1.3) = 1090519040
         # CPU calculation:
         #   cap = min(4.0, 1024 * 0.25 / 128) = 2.0
-        #   target = min(2.0, 1395864372 / 4 GiB) = 0.33
+        #   target = min(2.0, 1090519040 / 4 GiB) = 0.25
         HashOperatorTestCase(
             input_size_bytes=50 * GiB,
             input_num_blocks=200,
             target_num_partitions=None,
             total_cpu=1024,  # Many CPUs
-            expected_num_partitions=200,
-            expected_num_aggregators=128,  # min(200, min(1000, 128 (default max))
+            expected_num_partitions=128,  # min(200, max_shuffle_aggregators=128)
+            expected_num_aggregators=128,  # min(128, min(1024, 128 (default max))
             expected_ray_remote_args={
-                "max_concurrency": 2,  # ceil(200 / 128)
-                "num_cpus": 0.33,
-                "memory": 1395864372,
+                "max_concurrency": 1,  # ceil(128 / 128)
+                "num_cpus": 0.25,
+                "memory": 1090519040,
                 "scheduling_strategy": "SPREAD",
                 "allow_out_of_order_execution": True,
             },
@@ -607,6 +619,71 @@ def test_hash_shuffle_operator_remote_args(
 
             assert pool.num_aggregators == tc.expected_num_aggregators
             assert pool._aggregator_ray_remote_args == tc.expected_ray_remote_args
+
+
+def _make_hash_aggregate_op(input_num_blocks, total_cpu=512.0):
+    logical_op_mock = MagicMock(LogicalOperator)
+    logical_op_mock.infer_metadata.return_value = BlockMetadata(
+        num_rows=None, size_bytes=None, exec_stats=None, input_files=None
+    )
+    logical_op_mock.estimated_num_outputs.return_value = input_num_blocks
+
+    op_mock = MagicMock(PhysicalOperator)
+    op_mock._output_dependencies = []
+    op_mock._logical_operators = [logical_op_mock]
+    op_mock.num_output_splits.return_value = 1
+
+    with patch(
+        "ray.data._internal.execution.operators.hash_shuffle.ray.cluster_resources",
+        return_value={"CPU": total_cpu, "memory": 32 * GiB},
+    ):
+        return HashAggregateOperator(
+            input_op=op_mock,
+            data_context=DataContext.get_current(),
+            aggregation_fns=[Count()],
+            key_columns=("id",),
+            num_partitions=None,
+        )
+
+
+def test_hash_shuffle_cap_binds_when_estimate_far_exceeds_aggregator_pool(
+    ray_start_regular, restore_data_context
+):
+    """Reproduces the tpch_q18/q20 shape: a byte-size-driven estimate (653)
+    far exceeds the 128-aggregator cap. With DSv2 on (the default) and the
+    kill switch on (the default), the auto-derived partition count must be
+    clamped to the aggregator pool size, not left at the raw estimate."""
+    DataContext.get_current().use_datasource_v2 = True
+    DataContext.get_current().hash_shuffle_cap_target_partitions_to_aggregators = True
+
+    op = _make_hash_aggregate_op(input_num_blocks=653)
+
+    assert op._num_partitions == 128
+
+
+def test_hash_shuffle_cap_disabled_by_kill_switch(
+    ray_start_regular, restore_data_context
+):
+    """Same shape as above, but with the kill switch off -- the raw,
+    uncapped estimate must be restored, proving the rollback path works."""
+    DataContext.get_current().use_datasource_v2 = True
+    DataContext.get_current().hash_shuffle_cap_target_partitions_to_aggregators = False
+
+    op = _make_hash_aggregate_op(input_num_blocks=653)
+
+    assert op._num_partitions == 653
+
+
+def test_hash_shuffle_cap_does_not_apply_to_v1(ray_start_regular, restore_data_context):
+    """The cap must never engage for a V1-sourced estimate, regardless of the
+    kill switch -- V1's own read-task-count-driven estimates must be left
+    exactly as-is (see the DSv2-only gating in HashShufflingOperatorBase)."""
+    DataContext.get_current().use_datasource_v2 = False
+    DataContext.get_current().hash_shuffle_cap_target_partitions_to_aggregators = True
+
+    op = _make_hash_aggregate_op(input_num_blocks=653)
+
+    assert op._num_partitions == 653
 
 
 def test_aggregator_ray_remote_args_includes_context_label_selector(

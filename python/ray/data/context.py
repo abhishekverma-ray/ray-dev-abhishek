@@ -177,6 +177,20 @@ DEFAULT_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED = env_bool(
     "RAY_DATA_READ_FILES_ESTIMATED_NUM_OUTPUTS_CAP_ENABLED", True
 )
 
+# Kill switch: cap a hash-shuffle op's auto-derived (no explicit num_partitions
+# given) target_num_partitions to the aggregator pool size it will actually run
+# with. Without this, a byte-size-driven partition estimate can propose far more
+# partitions than aggregators, round-robin-fragmenting each actor's share into
+# many small hand-offs instead of ~1 large one for the same total bytes moved
+# (confirmed: two live TPC-H A/Bs at SF100 measured a ~41-42% Shuffle+Aggregation
+# throughput drop at a 653:128 partitions:aggregators ratio vs. V1's 100:100).
+# DSv2-only regardless of this switch -- see use_datasource_v2 in
+# HashShufflingOperatorBase. Rollback switch in case the cap itself is ever
+# wrong for some workload.
+DEFAULT_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS = env_bool(
+    "RAY_DATA_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS", True
+)
+
 DEFAULT_ACTOR_PREFETCHER_ENABLED = False
 
 DEFAULT_USE_PUSH_BASED_SHUFFLE = bool(
@@ -748,6 +762,16 @@ class DataContext:
             :class:`IcebergConfig` for details.
         default_hash_shuffle_parallelism: Default parallelism level for hash-based
             shuffle operations if the number of partitions is unspecifed.
+        hash_shuffle_cap_target_partitions_to_aggregators: When True (the
+            default), a hash-shuffle op's auto-derived (no explicit
+            ``num_partitions``) target partition count is capped to the
+            aggregator pool size it will actually run with, whenever the read
+            feeding it is DataSourceV2 (see ``use_datasource_v2`` -- V1's own
+            read-task-count-driven estimates are never affected by this
+            switch). Without the cap, a byte-size-driven estimate can exceed
+            the aggregator count, round-robin-fragmenting each actor's share
+            into many small hand-offs for the same total bytes. Set to False
+            to restore the uncapped estimate.
         hash_shuffle_compression: Codec used to compress hash-shuffle
             intermediate shards: "none", "lz4", or "zstd" (default "zstd").
         hash_shuffle_reduce_batch_size: Number of shard object references each
@@ -840,6 +864,13 @@ class DataContext:
     # Default hash-shuffle parallelism level (will be used when not
     # provided explicitly)
     default_hash_shuffle_parallelism: int = DEFAULT_MIN_PARALLELISM
+
+    # Kill switch: cap a hash-shuffle op's auto-derived target partition count to
+    # its aggregator pool size, DSv2-only. See
+    # DEFAULT_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS.
+    hash_shuffle_cap_target_partitions_to_aggregators: bool = (
+        DEFAULT_HASH_SHUFFLE_CAP_TARGET_PARTITIONS_TO_AGGREGATORS
+    )
 
     # Codec for hash-shuffle intermediate shards ("none", "lz4", or "zstd").
     hash_shuffle_compression: str = DEFAULT_HASH_SHUFFLE_COMPRESSION
