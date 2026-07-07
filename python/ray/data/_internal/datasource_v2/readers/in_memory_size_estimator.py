@@ -1,6 +1,7 @@
 import logging
+import math
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -33,14 +34,29 @@ class InMemorySizeEstimator(ABC):
         ...
 
 
+# Sampling parameters for SamplingInMemorySizeEstimator's encoding-ratio
+# estimate -- mirrors V1's ParquetDatasource._sample_fragments
+# (parquet_datasource.py): average a handful of files spread evenly across
+# the manifest instead of trusting a single file, to smooth out
+# file-to-file compression/encoding variance. A single-file sample can
+# diverge substantially from the true dataset-wide ratio -- confirmed via a
+# live A/B on the same table: V1's multi-file-averaged estimate was ~3x
+# V2's single-file one.
+_ENCODING_RATIO_SAMPLING_RATIO = 0.01
+_ENCODING_RATIO_MIN_NUM_SAMPLES = 2
+_ENCODING_RATIO_MAX_NUM_SAMPLES = 10
+
+
 @DeveloperAPI
 class SamplingInMemorySizeEstimator(InMemorySizeEstimator):
     """Estimates in-memory sizes by reading files.
 
     This class estimates the in-memory size of files by multiplying the on-disk
-    size by an estimated encoding ratio. If an instance hasn't estimated an encoding
-    ratio yet, it'll read a file to estimate it. Otherwise, it'll use the previously
-    estimated encoding ratio.
+    size by an estimated encoding ratio, averaged over a handful of files spread
+    across the manifest (mirrors V1's ``ParquetDatasource._sample_fragments``) to
+    smooth out file-to-file compression/encoding variance. If an instance hasn't
+    estimated an encoding ratio yet, it'll sample files to estimate it. Otherwise,
+    it'll use the previously estimated encoding ratio.
 
     TODO: This approach doesn't work well for formats that produce multiple batches
     (because we assume a 1:1 encoding ratio) or for formats that vary in encoding
@@ -55,13 +71,10 @@ class SamplingInMemorySizeEstimator(InMemorySizeEstimator):
     def estimate_in_memory_sizes(self, manifest: FileManifest) -> np.ndarray:
         assert np.all(manifest.file_sizes >= 0)
 
-        for path, file_size in zip(manifest.paths, manifest.file_sizes):
-            if self._encoding_ratio is None:
-                # Estimating the encoding ratio can be expensive since it requires
-                # reading the file. So, we only estimate the encoding ratio if we don't
-                # already have one.
-                self._encoding_ratio = self._estimate_encoding_ratio(path, file_size)
-                break
+        if self._encoding_ratio is None:
+            # Estimating the encoding ratio can be expensive since it requires
+            # reading files. So, we only estimate it if we don't already have one.
+            self._encoding_ratio = self._estimate_encoding_ratio(manifest)
 
         if self._encoding_ratio is None:
             # If we couldn't estimate the encoding ratio, assume a 1:1 encoding ratio.
@@ -69,13 +82,51 @@ class SamplingInMemorySizeEstimator(InMemorySizeEstimator):
         else:
             return manifest.file_sizes * self._encoding_ratio
 
-    def _estimate_encoding_ratio(
+    def _estimate_encoding_ratio(self, manifest: FileManifest) -> Optional[float]:
+        """Estimate the dataset's encoding ratio (in-memory size / on-disk size)
+        by sampling a handful of files spread evenly across ``manifest`` and
+        averaging their individual ratios.
+
+        Args:
+            manifest: The manifest to sample files from.
+
+        Returns:
+            The estimated encoding ratio, or ``None`` if no sampled file yielded
+            a usable ratio.
+        """
+        n = len(manifest)
+        if n == 0:
+            return None
+
+        target_num_samples = math.ceil(n * _ENCODING_RATIO_SAMPLING_RATIO)
+        target_num_samples = max(
+            min(target_num_samples, _ENCODING_RATIO_MAX_NUM_SAMPLES),
+            _ENCODING_RATIO_MIN_NUM_SAMPLES,
+        )
+        # Make sure the number of samples doesn't exceed the number of files.
+        target_num_samples = min(target_num_samples, n)
+        pivots = np.linspace(0, n - 1, target_num_samples).astype(int)
+
+        ratios: List[float] = []
+        for idx in pivots.tolist():
+            ratio = self._estimate_file_encoding_ratio(
+                manifest.paths[idx], manifest.file_sizes[idx]
+            )
+            if ratio is not None:
+                ratios.append(ratio)
+
+        if not ratios:
+            return None
+        return float(np.mean(ratios))
+
+    def _estimate_file_encoding_ratio(
         self,
         path: str,
         file_size: int,
     ) -> Optional[float]:
         """
-        Estimate the encoding ratio (in-memory size / on-disk size) for a file.
+        Estimate the encoding ratio (in-memory size / on-disk size) for a single
+        file.
 
         Args:
             path: The path to the file.

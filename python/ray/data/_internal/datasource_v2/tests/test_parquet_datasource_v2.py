@@ -335,6 +335,65 @@ def test_estimate_v2_read_size_bytes_extrapolates_over_full_listing(tmp_path):
     assert estimate == expected
 
 
+def test_sampling_in_memory_size_estimator_averages_multiple_files(tmp_path):
+    # Regression test for a review-confirmed accuracy gap (~3x, observed live
+    # on a real TPC-H `lineitem` table): the estimator used to sample exactly
+    # ONE file to establish the whole dataset's encoding ratio, even when many
+    # more files were already available in the sample. V1's
+    # ParquetDatasource._sample_fragments instead averages 2-10 files spread
+    # across the manifest specifically to smooth out file-to-file compression
+    # variance -- mirror that here.
+    import numpy as np
+
+    from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+        SamplingInMemorySizeEstimator,
+    )
+
+    # File A: a single repeated value -- highly compressible (RLE/dictionary
+    # encoding), so its encoding ratio (in-memory / on-disk) is large.
+    path_a = str(tmp_path / "a.parquet")
+    _write_parquet(path_a, pa.table({"a": [0] * 20_000}))
+
+    # File B: high-entropy random values -- defeats RLE/dictionary/delta
+    # encoding, so its encoding ratio is much closer to 1:1.
+    path_b = str(tmp_path / "b.parquet")
+    rng = np.random.default_rng(42)
+    random_values = rng.integers(0, 2**62, size=20_000, dtype=np.int64).tolist()
+    _write_parquet(path_b, pa.table({"a": random_values}))
+
+    datasource = ParquetDatasourceV2([str(tmp_path)])
+
+    def _ratio_for(paths):
+        m = _manifest_of(paths)
+        scanner = datasource.create_scanner(datasource.infer_schema(m))
+        estimator = SamplingInMemorySizeEstimator(scanner.create_reader())
+        in_memory_bytes = float(estimator.estimate_in_memory_sizes(m).sum())
+        return in_memory_bytes / float(m.file_sizes.sum())
+
+    ratio_a_only = _ratio_for([path_a])
+    ratio_b_only = _ratio_for([path_b])
+    # Test premise: file A must be meaningfully more compressible than B, or
+    # this test isn't exercising anything.
+    assert ratio_a_only > ratio_b_only * 1.5
+
+    combined_manifest = _manifest_of([path_a, path_b])
+    combined_scanner = datasource.create_scanner(
+        datasource.infer_schema(combined_manifest)
+    )
+    combined_estimator = SamplingInMemorySizeEstimator(combined_scanner.create_reader())
+    combined_estimator.estimate_in_memory_sizes(combined_manifest)
+    averaged_ratio = combined_estimator._encoding_ratio
+
+    # The averaged ratio must land strictly between the two individual
+    # ratios -- not collapse to either single file's ratio alone, which is
+    # what sampling only the first file (path_a) would produce.
+    assert (
+        min(ratio_a_only, ratio_b_only)
+        < averaged_ratio
+        < max(ratio_a_only, ratio_b_only)
+    )
+
+
 def test_estimate_v2_read_size_bytes_returns_none_on_listing_failure(
     tmp_path, monkeypatch
 ):
