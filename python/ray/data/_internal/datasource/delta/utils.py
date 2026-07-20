@@ -230,19 +230,220 @@ def get_file_info_with_retry(
 
 
 # ----------------------------------------------------------------------
-# Storage options (pass-through only; cloud auto-detection + explicit
-# filesystem construction are added in the follow-up PR).
+# Storage options (cloud credential auto-detection).
 # ----------------------------------------------------------------------
 
 
 def get_storage_options(
     path: str, provided: Optional[Dict[str, str]] = None
 ) -> Dict[str, str]:
-    """Return storage options dict for the given path.
+    """Resolve storage options, auto-detecting cloud credentials where possible.
 
-    Pass-through only; caller-supplied options are returned unchanged.
+    Caller-supplied options always win. Auto-detected entries fill in
+    missing keys for s3://, abfs[s]://, gs://, gcs:// paths.
+
+    Safe to call again mid-write to pick up freshly rotated/refreshed
+    credentials -- each call re-runs the underlying SDK's own credential
+    resolution (``boto3.Session().get_credentials()`` etc.) rather than
+    caching anything here.
     """
-    return dict(provided or {})
+    options = dict(provided or {})
+    path_lower = path.lower()
+    if path_lower.startswith(("s3://", "s3a://")):
+        options = {**_get_aws_credentials(), **options}
+    elif path_lower.startswith(("abfss://", "abfs://")):
+        options = {**_get_azure_credentials(), **options}
+    elif path_lower.startswith(("gs://", "gcs://")):
+        options = {**_get_gcs_credentials(), **options}
+    return options
+
+
+# Substring patterns identifying an authentication/authorization failure from
+# a cloud filesystem, as opposed to a transient network/IO error. Matched the
+# same way ``commit_retried_errors`` already matches transient errors (see
+# ``ray._common.retry.call_with_retry``): a case-sensitive substring check
+# against ``str(exc)``. Deliberately broad across providers -- these strings
+# are stable across botocore/azure-sdk/google-auth exception messages.
+AUTH_ERROR_PATTERNS: List[str] = [
+    # AWS / S3 (botocore, PyArrow S3FileSystem).
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidAccessKeyId",
+    "SignatureDoesNotMatch",
+    "RequestTimeTooSkewed",
+    "AccessDenied",
+    "UnrecognizedClientException",
+    # Azure.
+    "AuthenticationFailed",
+    "InvalidAuthenticationInfo",
+    "ExpiredAuthenticationToken",
+    # GCS.
+    "invalid_grant",
+    "Invalid Credentials",
+    # Generic HTTP status codes surfaced by cloud filesystem clients.
+    "401 ",
+    "403 ",
+]
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """Best-effort check for whether ``exc`` is an authentication/authorization
+    failure from a cloud filesystem (expired/invalid credentials), as opposed
+    to a transient network error or a genuine logical error.
+
+    Used to trigger a credential-refresh-and-retry rather than the plain
+    backoff-and-retry used for transient errors: retrying an auth failure
+    unchanged always fails identically, so it needs a different response.
+    """
+    message = str(exc)
+    return any(pattern in message for pattern in AUTH_ERROR_PATTERNS)
+
+
+def _get_aws_credentials() -> Dict[str, str]:
+    try:
+        import boto3
+
+        session = boto3.Session()
+        creds = session.get_credentials()
+        if not creds:
+            return {}
+        result = {
+            "AWS_ACCESS_KEY_ID": creds.access_key,
+            "AWS_SECRET_ACCESS_KEY": creds.secret_key,
+            "AWS_REGION": session.region_name or "us-east-1",
+        }
+        if creds.token:
+            result["AWS_SESSION_TOKEN"] = creds.token
+        return result
+    except Exception:
+        return {}
+
+
+def _get_azure_credentials() -> Dict[str, str]:
+    try:
+        from azure.identity import DefaultAzureCredential
+
+        credential = DefaultAzureCredential()
+        token = credential.get_token("https://storage.azure.com/.default")
+        return {"AZURE_STORAGE_TOKEN": token.token}
+    except Exception:
+        return {}
+
+
+def _get_gcs_credentials() -> Dict[str, str]:
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request
+
+        credentials, project = google.auth.default()
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        result: Dict[str, str] = {}
+        if project:
+            result["GOOGLE_CLOUD_PROJECT"] = project
+        if hasattr(credentials, "token") and credentials.token:
+            result["GOOGLE_SERVICE_ACCOUNT_TOKEN"] = credentials.token
+        return result
+    except Exception:
+        return {}
+
+
+def create_filesystem_from_storage_options(
+    path: str, storage_options: Optional[Dict[str, str]] = None
+) -> Optional[pa_fs.FileSystem]:
+    """Build a PyArrow filesystem from storage_options for cloud paths.
+
+    Returns None when no usable credentials are present so PyArrow falls
+    back to its default resolution chain.
+    """
+    if not storage_options:
+        return None
+    path_lower = path.lower()
+    if path_lower.startswith(("s3://", "s3a://")):
+        access_key = storage_options.get("AWS_ACCESS_KEY_ID")
+        secret_key = storage_options.get("AWS_SECRET_ACCESS_KEY")
+        session_token = storage_options.get("AWS_SESSION_TOKEN")
+        region = storage_options.get("AWS_REGION")
+        if access_key or secret_key or session_token or region:
+            return pa_fs.S3FileSystem(
+                access_key=access_key,
+                secret_key=secret_key,
+                session_token=session_token,
+                region=region,
+            )
+    elif path_lower.startswith(("abfss://", "abfs://")):
+        account_name = storage_options.get("AZURE_STORAGE_ACCOUNT_NAME")
+        token = storage_options.get("AZURE_STORAGE_TOKEN")
+        if account_name and token:
+            return pa_fs.AzureFileSystem(account_name=account_name, sas_token=token)
+        if account_name:
+            return pa_fs.AzureFileSystem(account_name=account_name)
+    elif path_lower.startswith(("gs://", "gcs://")):
+        service_account = storage_options.get("GOOGLE_SERVICE_ACCOUNT")
+        anonymous = storage_options.get("GOOGLE_ANONYMOUS", "").lower() == "true"
+        if service_account:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = service_account
+        if service_account or anonymous:
+            return pa_fs.GcsFileSystem(anonymous=anonymous)
+    return None
+
+
+# ----------------------------------------------------------------------
+# Commit properties (idempotency).
+# ----------------------------------------------------------------------
+
+
+def normalize_commit_properties(commit_properties):
+    """Normalise commit_properties for delta-rs transactions."""
+    if commit_properties is None:
+        return None
+    from deltalake.transaction import CommitProperties
+
+    if isinstance(commit_properties, CommitProperties):
+        return commit_properties
+    if not isinstance(commit_properties, dict):
+        raise TypeError(
+            "commit_properties must be a dict of string keys/values or "
+            "a deltalake.transaction.CommitProperties object"
+        )
+    commit_properties = dict(commit_properties)
+    max_commit_retries = commit_properties.pop("max_commit_retries", None)
+    if max_commit_retries is not None:
+        try:
+            max_commit_retries = int(max_commit_retries)
+        except (ValueError, TypeError) as e:
+            raise TypeError(
+                "commit_properties['max_commit_retries'] must be an integer"
+            ) from e
+
+    custom_metadata: Dict[str, str] = {}
+    for key, value in commit_properties.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise TypeError(
+                "commit_properties must be a dict of string keys and values"
+            )
+        custom_metadata[key] = value
+
+    return CommitProperties(
+        custom_metadata=custom_metadata or None,
+        max_commit_retries=max_commit_retries,
+        app_transactions=None,
+    )
+
+
+def create_app_transaction_id(write_uuid: Optional[str]):
+    """Create an idempotent app_transactions entry from a per-write UUID."""
+    from deltalake.transaction import Transaction
+
+    if write_uuid is None:
+        import time
+
+        write_uuid = f"ray_data_write_{int(time.time() * 1_000_000)}"
+    return Transaction(
+        app_id=f"ray.data.write_delta:{write_uuid}",
+        version=1,
+        last_updated=None,
+    )
 
 
 # ----------------------------------------------------------------------

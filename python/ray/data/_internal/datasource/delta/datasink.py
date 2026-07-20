@@ -13,11 +13,22 @@ Delta Lake: https://delta.io/
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import pyarrow as pa
 import pyarrow.fs as pa_fs
 
+from ray._common.retry import call_with_retry
 from ray.data._internal.datasource.delta.committer import (
     CommitInputs,
     commit_to_existing_table,
@@ -34,9 +45,13 @@ from ray.data._internal.datasource.delta.schema import (
     validate_and_plan_evolution,
 )
 from ray.data._internal.datasource.delta.utils import (
+    AUTH_ERROR_PATTERNS,
     DeltaWriteResult,
+    create_app_transaction_id,
     get_file_info_with_retry,
     get_storage_options,
+    is_auth_error,
+    normalize_commit_properties,
     resolve_under_table_root,
     try_get_deltatable,
     types_compatible,
@@ -108,6 +123,9 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         filesystem: Optional[pa_fs.FileSystem] = None,
         schema: Optional[pa.Schema] = None,
         schema_mode: str = "error",
+        credential_refresh_fn: Optional[
+            Callable[[], Tuple[Optional[Dict[str, str]], Optional[pa_fs.FileSystem]]]
+        ] = None,
         **write_kwargs,
     ):
         _check_import(self, module="deltalake", package="deltalake")
@@ -127,10 +145,41 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         self.write_kwargs = dict(write_kwargs)
         self._schema_policy = SchemaPolicy(mode=schema_mode.lower())
 
+        # Driver-side retry config. Pop the three recognised override keys so
+        # they don't leak through to delta-rs (which would raise on an
+        # unknown kwarg). Resolution chain, see ``_resolved_retry_config``:
+        #   per-call override > DataContext.delta_config > env-var default.
+        self._commit_retry_max_attempts: Optional[int] = self.write_kwargs.pop(
+            "commit_retry_max_attempts", None
+        )
+        self._commit_retry_max_backoff_s: Optional[int] = self.write_kwargs.pop(
+            "commit_retry_max_backoff_s", None
+        )
+        self._commit_retried_errors: Optional[List[str]] = self.write_kwargs.pop(
+            "commit_retried_errors", None
+        )
+
         target = write_kwargs.get("target_file_size_bytes")
         if target is not None and target <= 0:
             raise ValueError("target_file_size_bytes must be > 0")
         self._target_file_size_bytes: Optional[int] = target
+
+        # Driver-only: re-resolves write credentials on demand (e.g. re-vends
+        # from a ``Catalog``) when a cloud auth error is hit mid-write.
+        # Not pickled to workers -- see ``__getstate__`` -- since it typically
+        # closes over a ``Catalog`` object that isn't meant to travel there.
+        # Workers instead refresh via local auto-detection; see
+        # ``_refresh_worker_filesystem``.
+        self._credential_refresh_fn = credential_refresh_fn
+        self._explicit_filesystem = filesystem is not None
+        # Whether this write was resolved via ``catalog=``. Workers can't
+        # re-vend from a ``Catalog`` (driver-only, not pickled -- see
+        # ``__getstate__``), so ``_refresh_worker_filesystem`` must not
+        # attempt its own auto-detection in this case: the pre-vended
+        # credentials are already baked into ``storage_options`` and would
+        # just be re-applied unchanged (auto-detection only fills in
+        # *missing* keys), silently masking the real expiry.
+        self._catalog_vended = credential_refresh_fn is not None
 
         self.storage_options = get_storage_options(
             self.table_uri, write_kwargs.get("storage_options")
@@ -142,6 +191,7 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
 
         # Driver-side state.
         self._skip_write: bool = False
+        self._aggregated_write_uuid: Optional[str] = None
 
         # Worker-side state.
         self._worker_fs: Optional[pa_fs.FileSystem] = None
@@ -180,6 +230,10 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         d.pop("filesystem", None)
         d.pop("_worker_fs", None)
         d.pop("_writer", None)
+        # Driver-only: typically closes over a ``Catalog`` object that isn't
+        # meant to reach workers. Workers refresh via local auto-detection
+        # instead (``_refresh_worker_filesystem``), which doesn't need it.
+        d.pop("_credential_refresh_fn", None)
         return d
 
     def __setstate__(self, state: dict) -> None:
@@ -187,6 +241,7 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         self.filesystem = None
         self._worker_fs = None
         self._writer = None
+        self._credential_refresh_fn = None
 
     # ------------------------------------------------------------------
     # Introspection.
@@ -213,7 +268,6 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
     # ------------------------------------------------------------------
     def on_write_start(self, schema: Optional[pa.Schema] = None) -> None:
         existing = try_get_deltatable(self.table_uri, self.storage_options)
-        self._table_existed_at_start = existing is not None
 
         if existing is not None:
             if not self.partition_cols:
@@ -322,7 +376,7 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         try:
             validate_partition_columns_in_table(self.partition_cols, arrow_table)
             self._validate_block_against_declared_schema(arrow_table)
-            actions = self._writer.add_table(arrow_table, self._task_idx)
+            actions = self._add_table_with_refresh(arrow_table)
         except Exception as e:
             paths = list(self._task_written_files)
             # Dynamic attribute the framework reads in on_write_failed to
@@ -331,6 +385,17 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             self._cleanup_files_worker(paths)
             raise
         return (actions, arrow_table.schema)
+
+    def _add_table_with_refresh(self, arrow_table: pa.Table) -> List["AddAction"]:
+        """Write ``arrow_table`` via ``self._writer``, refreshing the
+        worker's cloud credentials and retrying once if the write fails
+        with an auth error (see ``_refresh_worker_filesystem``)."""
+        try:
+            return self._writer.add_table(arrow_table, self._task_idx)
+        except Exception as e:
+            if is_auth_error(e) and self._refresh_worker_filesystem():
+                return self._writer.add_table(arrow_table, self._task_idx)
+            raise
 
     def _validate_block_against_declared_schema(self, table: pa.Table) -> None:
         """Raise if the incoming block is missing a declared schema column or
@@ -369,12 +434,58 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
         if self._skip_write or self._writer is None:
             return []
         try:
-            return self._writer.flush(self._task_idx)
+            return self._flush_with_refresh()
         except Exception as e:
             paths = list(self._task_written_files)
             e._table_written_paths = paths
             self._cleanup_files_worker(paths)
             raise
+
+    def _flush_with_refresh(self) -> List["AddAction"]:
+        """Flush ``self._writer``'s buffered partitions, refreshing the
+        worker's cloud credentials and retrying once on an auth error."""
+        try:
+            return self._writer.flush(self._task_idx)
+        except Exception as e:
+            if is_auth_error(e) and self._refresh_worker_filesystem():
+                return self._writer.flush(self._task_idx)
+            raise
+
+    def _refresh_worker_filesystem(self) -> bool:
+        """Re-resolve credentials and rebuild the worker-side filesystem
+        in place (mutating ``self._writer.filesystem`` directly, which
+        preserves the writer's buffered-but-unflushed partition state).
+
+        Workers only refresh via local auto-detection -- re-running the
+        same cloud SDK credential resolution (``boto3.Session()`` etc.)
+        that originally built ``storage_options``, on the assumption that
+        workers share ambient credentials (IAM role, instance profile)
+        with the driver. This does not cover an explicit user-supplied
+        ``filesystem=`` (nothing to rebuild from) or a ``catalog=``-vended
+        filesystem (re-vending requires calling back to the ``Catalog``,
+        which is driver-only -- see ``DeltaDatasink._credential_refresh_fn``
+        and its module docstring).
+        """
+        from ray.data.context import DataContext
+
+        if self._explicit_filesystem or self._catalog_vended:
+            return False
+        if not DataContext.get_current().delta_config.credential_refresh_enabled:
+            return False
+        new_storage_options = get_storage_options(
+            self.table_uri, self.write_kwargs.get("storage_options")
+        )
+        self.storage_options = new_storage_options
+        self._fs_config, _ = make_fs_config(self.table_uri, None, new_storage_options)
+        self._worker_fs = worker_filesystem(self._fs_config)
+        if self._writer is not None:
+            self._writer.filesystem = self._worker_fs
+        logger.info(
+            "Refreshed Delta write credentials on worker for %s after an "
+            "auth error.",
+            self.table_uri,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Driver lifecycle -- on_write_complete (aggregate, reconcile, commit).
@@ -401,7 +512,6 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
     def _aggregate_and_commit(self, returns: List[DeltaWriteResult]) -> None:
         all_actions: List["AddAction"] = []
         all_schemas: List[pa.Schema] = []
-        aggregated_write_uuid: Optional[str] = None
         seen_paths: Set[str] = set()
 
         for r in returns:
@@ -414,8 +524,8 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             if r.emitted_schemas:
                 all_schemas.extend(r.emitted_schemas)
             uuid_val = r.task_metadata.get("write_uuid") if r.task_metadata else None
-            if uuid_val and aggregated_write_uuid is None:
-                aggregated_write_uuid = uuid_val
+            if uuid_val and self._aggregated_write_uuid is None:
+                self._aggregated_write_uuid = uuid_val
 
         unified_schema = (
             _unify_schemas(all_schemas) if all_schemas else self._declared_schema
@@ -514,25 +624,41 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             mode=SaveMode.APPEND.value,
             partition_cols=self.partition_cols,
             storage_options=self.storage_options,
-            write_kwargs=self.write_kwargs,
+            write_kwargs=self._build_commit_kwargs(),
             local_filesystem_root=self._local_filesystem_root,
         )
+
+        desc_commit = f"commit to Delta table at {self.table_uri}"
+        desc_create = f"create Delta table at {self.table_uri}"
 
         if not file_actions:
             # Empty APPEND: create empty table if needed; otherwise no-op.
             if existing is None and self.schema is not None:
-                create_table_with_files(inputs, [], self.schema, self.filesystem)
+                self._with_retry(
+                    lambda: create_table_with_files(
+                        inputs, [], self.schema, self.filesystem
+                    ),
+                    description=desc_create,
+                )
             return
 
         validate_file_actions(
             file_actions, self.filesystem, self._local_filesystem_root
         )
         if existing:
-            commit_to_existing_table(
-                inputs, existing, file_actions, self.schema, self.filesystem
+            self._with_retry(
+                lambda: commit_to_existing_table(
+                    inputs, existing, file_actions, self.schema, self.filesystem
+                ),
+                description=desc_commit,
             )
         else:
-            create_table_with_files(inputs, file_actions, self.schema, self.filesystem)
+            self._with_retry(
+                lambda: create_table_with_files(
+                    inputs, file_actions, self.schema, self.filesystem
+                ),
+                description=desc_create,
+            )
 
     def _commit_overwrite(self, file_actions: List["AddAction"]) -> None:
         if self._skip_write:
@@ -544,9 +670,12 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             mode=SaveMode.OVERWRITE.value,
             partition_cols=self.partition_cols,
             storage_options=self.storage_options,
-            write_kwargs=self.write_kwargs,
+            write_kwargs=self._build_commit_kwargs(),
             local_filesystem_root=self._local_filesystem_root,
         )
+
+        desc_commit = f"commit to Delta table at {self.table_uri}"
+        desc_create = f"create Delta table at {self.table_uri}"
 
         if not file_actions:
             # OVERWRITE with no data. Static mode truncates the whole
@@ -562,12 +691,20 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             # which resolves to ``commit_mode="append"`` with no actions
             # here, i.e. a true no-op.
             if existing is not None:
-                commit_to_existing_table(
-                    inputs, existing, [], self.schema, self.filesystem
+                self._with_retry(
+                    lambda: commit_to_existing_table(
+                        inputs, existing, [], self.schema, self.filesystem
+                    ),
+                    description=desc_commit,
                 )
                 return
             if self.schema is not None:
-                create_table_with_files(inputs, [], self.schema, self.filesystem)
+                self._with_retry(
+                    lambda: create_table_with_files(
+                        inputs, [], self.schema, self.filesystem
+                    ),
+                    description=desc_create,
+                )
             return
 
         validate_file_actions(
@@ -577,11 +714,177 @@ class DeltaDatasink(Datasink[DeltaWriteResult]):
             # Either the table existed at start, or it appeared between
             # preflight and commit; in both cases OVERWRITE delete+append is
             # the correct outcome.
-            commit_to_existing_table(
-                inputs, existing, file_actions, self.schema, self.filesystem
+            self._with_retry(
+                lambda: commit_to_existing_table(
+                    inputs, existing, file_actions, self.schema, self.filesystem
+                ),
+                description=desc_commit,
             )
         else:
-            create_table_with_files(inputs, file_actions, self.schema, self.filesystem)
+            self._with_retry(
+                lambda: create_table_with_files(
+                    inputs, file_actions, self.schema, self.filesystem
+                ),
+                description=desc_create,
+            )
+
+    # ------------------------------------------------------------------
+    # Retry + commit-idempotency helpers.
+    # ------------------------------------------------------------------
+    def _resolved_retry_config(self) -> Tuple[int, int, List[str]]:
+        """Resolve (max_attempts, max_backoff_s, retried_errors).
+
+        Two-level precedence chain:
+          1. per-call kwargs (extracted from ``**write_kwargs`` at __init__)
+          2. ``DataContext.delta_config`` (the format-level default)
+
+        ``DataContext`` is consulted lazily so datasinks constructed before a
+        context exists still work in tests.
+        """
+        from ray.data.context import DataContext
+
+        cfg = DataContext.get_current().delta_config
+
+        max_attempts = (
+            self._commit_retry_max_attempts
+            if self._commit_retry_max_attempts is not None
+            else cfg.commit_max_attempts
+        )
+        max_backoff_s = (
+            self._commit_retry_max_backoff_s
+            if self._commit_retry_max_backoff_s is not None
+            else cfg.commit_retry_max_backoff_s
+        )
+        retried_errors = (
+            self._commit_retried_errors
+            if self._commit_retried_errors is not None
+            else cfg.commit_retried_errors
+        )
+        return max_attempts, max_backoff_s, list(retried_errors)
+
+    def _can_refresh_credentials(self) -> bool:
+        """Whether this datasink knows how to re-resolve write credentials.
+
+        True when a ``credential_refresh_fn`` was supplied (the ``catalog=``
+        path), or when the filesystem was auto-detected rather than an
+        explicit user-supplied ``filesystem=`` (which we don't know how to
+        rebuild). Used to decide whether it's worth matching auth errors as
+        retryable at all -- retrying one we can't actually refresh would
+        just fail identically on every attempt.
+        """
+        return self._credential_refresh_fn is not None or not self._explicit_filesystem
+
+    def _refresh_driver_filesystem(self) -> bool:
+        """Re-resolve credentials and rebuild the driver-side filesystem.
+
+        Returns ``True`` if a refresh was applied, ``False`` if there was
+        nothing this datasink knows how to refresh.
+        """
+        if not self._can_refresh_credentials():
+            return False
+        if self._credential_refresh_fn is not None:
+            new_storage_options, new_filesystem = self._credential_refresh_fn()
+        else:
+            new_storage_options = get_storage_options(
+                self.table_uri, self.write_kwargs.get("storage_options")
+            )
+            new_filesystem = None
+        if new_storage_options is not None:
+            self.storage_options = new_storage_options
+        self._fs_config, self.filesystem = make_fs_config(
+            self.table_uri, new_filesystem, self.storage_options
+        )
+        self._local_filesystem_root = self._fs_config.local_filesystem_root
+        logger.info(
+            "Refreshed Delta write credentials for %s after an auth error.",
+            self.table_uri,
+        )
+        return True
+
+    def _with_retry(self, func: Callable, description: str) -> Any:
+        """Driver-side retry wrapper for transient I/O / HTTP errors during
+        the commit metadata write, and for cloud auth errors (expired
+        session tokens, expired vended credentials) when credentials can be
+        refreshed (see ``_can_refresh_credentials``).
+
+        Concurrency-conflict retries are handled inside delta-rs itself via
+        ``CommitProperties.max_commit_retries``, plumbed through
+        ``_build_commit_kwargs``. The two layers compose: if a transient
+        network blip surfaces mid-retry, this wrapper restarts the whole
+        commit: the deterministic ``app_transactions`` id (also from
+        ``_build_commit_kwargs``) makes that restart idempotent.
+
+        Auth errors need a different response than transient ones: retrying
+        ``func`` unchanged always fails identically, since it closes over
+        ``self.filesystem``. So on an auth error we refresh
+        ``self.filesystem`` first, then re-raise -- ``call_with_retry``'s
+        own loop (matching against ``AUTH_ERROR_PATTERNS``) then retries
+        ``func``, which reads the now-fresh ``self.filesystem`` when it's
+        called again.
+        """
+        from ray.data.context import DataContext
+
+        max_attempts, max_backoff_s, retried_errors = self._resolved_retry_config()
+        refresh_enabled = (
+            DataContext.get_current().delta_config.credential_refresh_enabled
+        )
+        can_refresh = refresh_enabled and self._can_refresh_credentials()
+        if can_refresh:
+            retried_errors = list(retried_errors) + AUTH_ERROR_PATTERNS
+
+        def wrapped() -> Any:
+            try:
+                return func()
+            except Exception as e:
+                if can_refresh and is_auth_error(e):
+                    self._refresh_driver_filesystem()
+                raise
+
+        return call_with_retry(
+            wrapped,
+            description=description,
+            match=retried_errors,
+            max_attempts=max_attempts,
+            max_backoff_s=max_backoff_s,
+        )
+
+    def _build_commit_kwargs(self) -> Dict[str, Any]:
+        """Return write_kwargs augmented with idempotent CommitProperties."""
+        from deltalake.transaction import CommitProperties
+
+        existing = normalize_commit_properties(
+            self.write_kwargs.get("commit_properties")
+        )
+        max_retries = self.write_kwargs.get("max_commit_retries")
+        app_txn = (
+            create_app_transaction_id(self._aggregated_write_uuid)
+            if self._aggregated_write_uuid
+            else None
+        )
+        if existing is None:
+            commit_props = CommitProperties(
+                custom_metadata=None,
+                max_commit_retries=max_retries,
+                app_transactions=[app_txn] if app_txn else None,
+            )
+        else:
+            txns = list(existing.app_transactions or [])
+            if app_txn:
+                key = (app_txn.app_id, app_txn.version)
+                if all((t.app_id, t.version) != key for t in txns):
+                    txns.append(app_txn)
+            commit_props = CommitProperties(
+                custom_metadata=existing.custom_metadata,
+                max_commit_retries=(
+                    max_retries
+                    if max_retries is not None
+                    else existing.max_commit_retries
+                ),
+                app_transactions=txns or None,
+            )
+        result = dict(self.write_kwargs)
+        result["commit_properties"] = commit_props
+        return result
 
     # ------------------------------------------------------------------
     # Driver lifecycle -- on_write_failed (orphan cleanup).

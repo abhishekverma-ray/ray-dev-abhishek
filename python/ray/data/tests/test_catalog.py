@@ -489,6 +489,124 @@ def test_write_iceberg_rejects_catalog_kwargs_with_catalog(ray_start_regular_sha
     assert catalog.calls == []  # rejected before the catalog is consulted
 
 
+def test_write_delta_with_catalog(ray_start_regular_shared, tmp_path):
+    # write_delta resolves the table identifier on the driver and writes to
+    # the catalog-resolved physical location, requesting WRITE access.
+    pytest.importorskip("deltalake")
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    catalog = _FakeCatalog(ResolvedSource(path=out))
+    ray.data.range(3).write_delta("main.db.tbl", catalog=catalog)
+
+    assert catalog.calls == [
+        ("main.db.tbl", ReaderFormat.DELTA, CatalogAccessMode.WRITE)
+    ]
+    ds = ray.data.read_delta(out)
+    assert sorted(r["id"] for r in ds.take_all()) == [0, 1, 2]
+
+
+def test_write_delta_catalog_rejects_filesystem(ray_start_regular_shared, tmp_path):
+    # Passing both `filesystem` and `catalog` is rejected -- the catalog
+    # resolves the filesystem itself with the appropriate credentials.
+    pytest.importorskip("deltalake")
+    catalog = _FakeCatalog(
+        ResolvedSource(path=str(tmp_path / "out"), filesystem=pafs.LocalFileSystem())
+    )
+    with pytest.raises(ValueError, match="filesystem"):
+        ray.data.range(1).write_delta(
+            "main.db.tbl",
+            catalog=catalog,
+            filesystem=pafs.LocalFileSystem(),
+        )
+    assert catalog.calls == []  # rejected before the catalog is consulted
+
+
+def test_write_delta_catalog_merges_storage_options(ray_start_regular_shared, tmp_path):
+    # User-supplied storage_options keys win over catalog-vended ones.
+    pytest.importorskip("deltalake")
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    catalog = _FakeCatalog(
+        ResolvedSource(path=out, storage_options={"AWS_REGION": "vended-region"})
+    )
+    ray.data.range(1).write_delta(
+        "main.db.tbl",
+        catalog=catalog,
+        storage_options={"AWS_REGION": "user-region"},
+    )
+    assert catalog.calls == [
+        ("main.db.tbl", ReaderFormat.DELTA, CatalogAccessMode.WRITE)
+    ]
+
+
+def test_write_delta_catalog_distributed_uses_resolved_filesystem(
+    ray_start_regular_shared, tmp_path
+):
+    # A multi-block distributed write must reach the workers using the
+    # catalog-resolved filesystem, not silently fall back to `from_uri`
+    # (regression test for the `_FsConfig`/`worker_filesystem` fix). Rooted
+    # in a SubTreeFileSystem, mirroring how a real catalog vends a
+    # bucket/account-rooted filesystem (e.g. Unity Catalog's S3FileSystem).
+    pytest.importorskip("deltalake")
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    rooted_fs = pafs.SubTreeFileSystem(out, pafs.LocalFileSystem())
+    catalog = _FakeCatalog(ResolvedSource(path=out, filesystem=rooted_fs))
+    ray.data.range(20, override_num_blocks=4).write_delta(
+        "main.db.tbl", catalog=catalog
+    )
+    ds = ray.data.read_delta(out)
+    assert sorted(r["id"] for r in ds.take_all()) == list(range(20))
+
+
+class _RefreshingFakeCatalog(Catalog):
+    """Returns storage_options that differ on every call, to verify that a
+    credential-refresh-on-auth-error re-invokes resolve() rather than
+    retrying with the same (expired) vended credentials."""
+
+    def __init__(self, path):
+        self._path = path
+        self.calls = 0
+
+    def resolve(self, table, *, reader, mode=CatalogAccessMode.WRITE):
+        self.calls += 1
+        return ResolvedSource(
+            path=self._path,
+            storage_options={"AWS_SESSION_TOKEN": f"token-{self.calls}"},
+        )
+
+
+def test_write_delta_catalog_credentials_refresh_on_auth_error(
+    ray_start_regular_shared, tmp_path
+):
+    # A cloud auth error during commit re-invokes catalog.resolve() to get
+    # fresh vended credentials, instead of retrying with the same (expired)
+    # ones -- the driver-side counterpart to
+    # test_write_delta_catalog_distributed_uses_resolved_filesystem.
+    pytest.importorskip("deltalake")
+    from ray.data._internal.datasource.delta import datasink as _datasink
+
+    out = str(tmp_path / "out")
+    os.makedirs(out)
+    catalog = _RefreshingFakeCatalog(out)
+
+    real_commit = _datasink.create_table_with_files
+    attempts = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise IOError("ExpiredToken: the session token has expired")
+        return real_commit(*args, **kwargs)
+
+    with mock.patch.object(_datasink, "create_table_with_files", flaky):
+        ray.data.range(3).write_delta("main.db.tbl", catalog=catalog)
+
+    assert catalog.calls == 2, "resolve() should be re-invoked once on refresh"
+    ds = ray.data.read_delta(out)
+    assert sorted(r["id"] for r in ds.take_all()) == [0, 1, 2]
+
+
 # ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------

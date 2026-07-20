@@ -230,6 +230,14 @@ DEFAULT_ICEBERG_CATALOG_RETRIED_ERRORS = (
     "DEADLINE_EXCEEDED",
 )
 
+DEFAULT_DELTA_COMMIT_MAX_ATTEMPTS = env_integer("RAY_DATA_DELTA_COMMIT_MAX_ATTEMPTS", 5)
+DEFAULT_DELTA_COMMIT_RETRY_MAX_BACKOFF_S = env_integer(
+    "RAY_DATA_DELTA_COMMIT_RETRY_MAX_BACKOFF_S", 16
+)
+# Same transient-error substrings as Iceberg's catalog retries -- both are
+# HTTP / connection-level errors from the underlying storage or metastore.
+DEFAULT_DELTA_COMMIT_RETRIED_ERRORS = DEFAULT_ICEBERG_CATALOG_RETRIED_ERRORS
+
 DEFAULT_LANCE_READ_FRAGMENTS_ERRORS_TO_RETRY = ("LanceError(IO)",)
 DEFAULT_LANCE_READ_FRAGMENTS_MAX_ATTEMPTS = env_integer(
     "RAY_DATA_LANCE_READ_FRAGMENTS_MAX_ATTEMPTS", 10
@@ -375,6 +383,36 @@ class IcebergConfig:
     catalog_retried_errors: List[str] = field(
         default_factory=lambda: list(DEFAULT_ICEBERG_CATALOG_RETRIED_ERRORS)
     )
+
+
+@DeveloperAPI
+@dataclass
+class DeltaConfig:
+    """Configuration for Delta Lake datasink retry behavior.
+
+    Args:
+        commit_max_attempts: Maximum number of retry attempts for a Delta
+            commit (driver-side, for transient I/O / network errors --
+            distinct from delta-rs's own internal concurrency-conflict
+            retries). Defaults to 5.
+        commit_retry_max_backoff_s: Maximum backoff time in seconds between
+            Delta commit retry attempts. Defaults to 16.
+        commit_retried_errors: A list of substrings of error messages that
+            should trigger a retry for Delta commit operations. Includes
+            common HTTP error codes and connection errors.
+        credential_refresh_enabled: Whether to re-resolve write credentials
+            and retry when a commit hits a cloud authentication error (e.g.
+            an expired session token or vended credential). Defaults to
+            ``True``. Set to ``False`` to disable -- e.g. if a custom
+            ``filesystem=`` should never be second-guessed.
+    """
+
+    commit_max_attempts: int = DEFAULT_DELTA_COMMIT_MAX_ATTEMPTS
+    commit_retry_max_backoff_s: int = DEFAULT_DELTA_COMMIT_RETRY_MAX_BACKOFF_S
+    commit_retried_errors: List[str] = field(
+        default_factory=lambda: list(DEFAULT_DELTA_COMMIT_RETRIED_ERRORS)
+    )
+    credential_refresh_enabled: bool = True
 
 
 @DeveloperAPI
@@ -644,6 +682,8 @@ class DataContext:
         iceberg_config: Configuration for Iceberg datasource operations including
             retry settings for file writes and catalog operations. See
             :class:`IcebergConfig` for details.
+        delta_config: Configuration for Delta Lake datasink retry behavior. See
+            :class:`DeltaConfig` for details.
         default_hash_shuffle_parallelism: Default parallelism level for hash-based
             shuffle operations if the number of partitions is unspecifed.
         hash_shuffle_compression: Codec used to compress hash-shuffle
@@ -878,6 +918,7 @@ class DataContext:
     )
     lance_config: LanceConfig = field(default_factory=LanceConfig)
     iceberg_config: IcebergConfig = field(default_factory=IcebergConfig)
+    delta_config: DeltaConfig = field(default_factory=DeltaConfig)
     enable_per_node_metrics: bool = DEFAULT_ENABLE_PER_NODE_METRICS
     override_object_store_memory_limit_fraction: float = None
     memory_usage_poll_interval_s: Optional[float] = 1

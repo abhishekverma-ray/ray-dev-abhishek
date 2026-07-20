@@ -5,12 +5,12 @@ pickleable. The driver resolves a PyArrow filesystem once (either the
 explicit ``filesystem=`` the caller supplied, or one built from ``table_uri``
 via ``FileSystem.from_uri``); each worker rebuilds an equivalent filesystem
 from a small picklable config rather than pickling the filesystem object
-itself -- with one exception: an explicitly-supplied filesystem is carried
-through as-is, since PyArrow filesystems such as ``S3FileSystem`` are
-themselves picklable, and a caller-supplied filesystem may not be
-reconstructable from ``table_uri`` alone (e.g. a ``SubTreeFileSystem``
-rooted somewhere other than the table's own URI, or one carrying
-credentials the worker's ambient environment doesn't have).
+itself -- with one exception: an explicitly-supplied filesystem (from the
+caller directly, or resolved by a ``Catalog``) is carried through as-is,
+since PyArrow filesystems such as ``S3FileSystem``/``GcsFileSystem`` are
+themselves picklable and may carry credentials that can't be reconstructed
+from ``storage_options`` alone (e.g. a vended session token with no
+corresponding on-disk profile).
 
 PyArrow filesystem: https://arrow.apache.org/docs/python/api/filesystems.html
 """
@@ -31,8 +31,8 @@ class _FsConfig:
     # Used to resolve Delta-relative file paths; see module docstring on
     # ``make_fs_config``.
     local_filesystem_root: Optional[str] = None
-    # Set only when the caller supplied an explicit filesystem. Carried to
-    # the worker as-is -- see module docstring.
+    # Set only when the caller supplied an explicit filesystem (directly, or
+    # via a Catalog). Carried to the worker as-is -- see module docstring.
     explicit_filesystem: Optional[pa_fs.FileSystem] = None
 
 
@@ -79,11 +79,24 @@ def make_fs_config(
 def worker_filesystem(config: _FsConfig) -> pa_fs.FileSystem:
     """Materialise the filesystem on a worker from a picklable config.
 
-    Returns the explicitly-supplied filesystem as-is when there is one
-    (matching the driver exactly, including its root/credentials);
-    otherwise rebuilds a path-only filesystem from ``table_uri``.
+    Resolution order:
+      1. An explicitly-supplied filesystem (carried through as-is).
+      2. A filesystem built from ``storage_options`` (e.g. a vended cloud
+         session token), so credentials that were auto-detected or vended on
+         the driver reach the worker's writes too.
+      3. A path-only ``from_uri`` filesystem (ambient worker credentials).
     """
     if config.explicit_filesystem is not None:
         return config.explicit_filesystem
+
+    from ray.data._internal.datasource.delta.utils import (
+        create_filesystem_from_storage_options,
+    )
+
+    fs = create_filesystem_from_storage_options(
+        config.table_uri, config.storage_options
+    )
+    if fs is not None:
+        return fs
     fs, _ = pa_fs.FileSystem.from_uri(config.table_uri)
     return fs

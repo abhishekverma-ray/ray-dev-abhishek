@@ -4747,6 +4747,7 @@ class Dataset:
         self,
         path: str,
         *,
+        catalog: Optional["Catalog"] = None,
         mode: str = "append",
         partition_cols: Optional[List[str]] = None,
         filesystem: Optional["pyarrow.fs.FileSystem"] = None,
@@ -4765,7 +4766,18 @@ class Dataset:
             >>> ds.write_delta("/tmp/my-delta-table", mode="overwrite")  # doctest: +SKIP
 
         Args:
-            path: Path to the Delta table.
+            path: Path to the Delta table. When ``catalog`` is provided, this
+                is instead a catalog table identifier (e.g.
+                ``"catalog.schema.table"``) that the catalog resolves to a
+                physical location.
+            catalog: An optional :class:`~ray.data.Catalog` (e.g.
+                :class:`~ray.data.DatabricksUnityCatalog`). When provided,
+                ``path`` is interpreted as a catalog table identifier rather
+                than a filesystem path, and the catalog resolves the physical
+                write location and write credentials. If both ``filesystem``
+                and ``catalog`` are given, an error is raised -- the catalog
+                resolves the filesystem with appropriate credentials
+                automatically.
             mode: Determines how to handle an existing table. One of
                 ``"append"`` (default), ``"overwrite"``, ``"error"``, or
                 ``"ignore"``. ``"error"`` raises if the table already exists;
@@ -4789,6 +4801,51 @@ class Dataset:
                 ``write_statistics``, ``target_file_size_bytes``,
                 ``storage_options``.
         """
+        credential_refresh_fn = None
+        if catalog is not None:
+            from ray.data.catalog import CatalogAccessMode, ReaderFormat
+
+            if filesystem is not None:
+                raise ValueError(
+                    "`filesystem` cannot be specified with `catalog`. The "
+                    "`catalog` will resolve the `filesystem` with appropriate "
+                    "credentials automatically."
+                )
+            catalog_table_identifier = path
+            user_storage_options = write_kwargs.get("storage_options")
+            resolved = catalog.resolve(
+                catalog_table_identifier,
+                reader=ReaderFormat.DELTA,
+                mode=CatalogAccessMode.WRITE,
+            )
+            path = resolved.path
+            if resolved.storage_options:
+                write_kwargs["storage_options"] = {
+                    **resolved.storage_options,
+                    **(user_storage_options or {}),
+                }
+            if resolved.filesystem is not None:
+                filesystem = resolved.filesystem
+
+            def credential_refresh_fn() -> Tuple[
+                Optional[Dict[str, str]], Optional["pyarrow.fs.FileSystem"]
+            ]:
+                # Re-resolves write credentials from ``catalog`` on demand
+                # (e.g. when the originally-vended credentials expire during
+                # a long-running write). Merged the same way as the initial
+                # resolution above -- user-supplied storage_options still win.
+                fresh = catalog.resolve(
+                    catalog_table_identifier,
+                    reader=ReaderFormat.DELTA,
+                    mode=CatalogAccessMode.WRITE,
+                )
+                merged_storage_options = (
+                    {**fresh.storage_options, **(user_storage_options or {})}
+                    if fresh.storage_options
+                    else None
+                )
+                return merged_storage_options, fresh.filesystem
+
         datasink = DeltaDatasink(
             path,
             mode=mode,
@@ -4796,6 +4853,7 @@ class Dataset:
             filesystem=filesystem,
             schema=schema,
             schema_mode=schema_mode,
+            credential_refresh_fn=credential_refresh_fn,
             **write_kwargs,
         )
         self.write_datasink(
